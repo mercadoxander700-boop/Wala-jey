@@ -37,11 +37,37 @@ UA = (
 PROXY_FILE = "proxy.txt"
 PROXIES_OUTPUT = "proxies.txt"
 API_PORT = 5000
+DELAY_BETWEEN_ACCOUNTS = 5  # seconds between account creation cycles
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 def gen_str(n: int = 8) -> str:
     return "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=n))
+
+
+def load_harvested_proxies() -> list[str]:
+    """Load proxies from the harvested proxies.txt output file."""
+    if not os.path.exists(PROXIES_OUTPUT):
+        return []
+    with open(PROXIES_OUTPUT, "r") as fh:
+        lines = fh.read().strip().splitlines()
+    return [l.strip() for l in lines if l.strip()]
+
+
+def pick_request_proxy(harvested: list[str]) -> dict | None:
+    """Return a random requests-compatible proxy dict from harvested proxies."""
+    if not harvested:
+        return None
+    raw = random.choice(harvested)
+    parts = raw.split(":")
+    if len(parts) == 4:
+        user, pwd, host, port = parts
+        url = f"http://{user}:{pwd}@{host}:{port}"
+    elif len(parts) == 2:
+        url = f"http://{parts[0]}:{parts[1]}"
+    else:
+        url = f"http://{raw}"
+    return {"http": url, "https": url}
 
 
 def load_proxies() -> list[str]:
@@ -220,7 +246,7 @@ def solve_captcha() -> str | None:
 
 
 # ── GoLogin API ─────────────────────────────────────────────────────────────
-def get_proxies_from_gologin(bearer: str) -> bool:
+def get_proxies_from_gologin(bearer: str, req_proxy: dict | None = None) -> bool:
     """Fetch proxy list from GoLogin and append to *proxies.txt*."""
     print("=> Fetching proxies from GoLogin...")
     headers = {
@@ -235,6 +261,7 @@ def get_proxies_from_gologin(bearer: str) -> bool:
             headers=headers,
             timeout=30,
             verify=False,
+            proxies=req_proxy,
         )
         if resp.status_code != 200:
             print(f"=> Proxy fetch failed [{resp.status_code}]")
@@ -254,9 +281,11 @@ def get_proxies_from_gologin(bearer: str) -> bool:
         return False
 
 
-def create_account(captcha_token: str) -> bool:
+def create_account(captcha_token: str, req_proxy: dict | None = None) -> bool:
     """Register a GoLogin account and fetch its proxies."""
     print("=> Creating account...")
+    if req_proxy:
+        print(f"   (using proxy: {list(req_proxy.values())[0][:40]}...)")
     email = f"user_{gen_str()}@ixcyon.top"
     pwd = f"tg@ixcynigga{random.randint(1000, 9999)}"
     headers = {
@@ -289,6 +318,7 @@ def create_account(captcha_token: str) -> bool:
             json=body,
             timeout=30,
             verify=False,
+            proxies=req_proxy,
         )
         if resp.status_code in (200, 201):
             print(f"=> Account created: {email}")
@@ -298,7 +328,7 @@ def create_account(captcha_token: str) -> bool:
             print("=> Saved to accounts.txt")
             time.sleep(0.5)
             if bearer:
-                get_proxies_from_gologin(bearer)
+                get_proxies_from_gologin(bearer, req_proxy=req_proxy)
             return True
         print(f"=> Account creation failed [{resp.status_code}]: {resp.text[:500]}")
         return False
@@ -332,26 +362,47 @@ def main() -> None:
         print("=> Exiting: solver server not available")
         return
 
-    # Solve captcha
-    token = solve_captcha()
-    if not token:
-        print("=> Exiting: captcha not solved")
-        return
+    # Continuous account creation loop
+    created = 0
+    failed = 0
+    print("=" * 50)
+    print("=> Starting continuous account creation")
+    print(f"=> Proxy API: http://0.0.0.0:{API_PORT}/proxies")
+    print(f"=> Press Ctrl+C to stop")
+    print("=" * 50)
 
-    # Create account with solved token
-    if create_account(token):
-        print("=> Done!")
-    else:
-        print("=> Failed to create account")
-
-    # Keep the proxy API server running so proxies stay accessible
-    print(f"=> Proxy API still running at http://0.0.0.0:{API_PORT}/proxies")
-    print("=> Press Ctrl+C to stop")
     try:
         while True:
-            time.sleep(60)
+            cycle = created + failed + 1
+            print(f"\n--- Cycle {cycle} (created: {created}, failed: {failed}) ---")
+
+            # Pick a random harvested proxy for API requests (if available)
+            harvested = load_harvested_proxies()
+            req_proxy = pick_request_proxy(harvested)
+            if req_proxy:
+                print(f"=> Using harvested proxy for API calls ({len(harvested)} available)")
+
+            # Solve captcha
+            token = solve_captcha()
+            if not token:
+                failed += 1
+                print(f"=> Captcha failed, retrying in {DELAY_BETWEEN_ACCOUNTS}s...")
+                time.sleep(DELAY_BETWEEN_ACCOUNTS)
+                continue
+
+            # Create account with proxy rotation
+            if create_account(token, req_proxy=req_proxy):
+                created += 1
+                print(f"=> Total accounts created: {created}")
+            else:
+                failed += 1
+
+            # Brief delay between cycles to avoid rate limiting
+            print(f"=> Waiting {DELAY_BETWEEN_ACCOUNTS}s before next cycle...")
+            time.sleep(DELAY_BETWEEN_ACCOUNTS)
+
     except KeyboardInterrupt:
-        print("\n=> Shutting down")
+        print(f"\n=> Shutting down. Created {created} accounts, {failed} failures.")
 
 
 if __name__ == "__main__":
