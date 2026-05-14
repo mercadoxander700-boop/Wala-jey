@@ -114,14 +114,46 @@ def load_proxies() -> list[str]:
     return [line.strip() for line in content.splitlines() if line.strip()]
 
 
-def build_proxy_file(proxies: list[str]) -> str | None:
-    """Write proxies to a temp file and return the path."""
-    if not proxies:
-        return None
-    tmp = "_proxies_loaded.txt"
-    with open(tmp, "w") as fh:
-        fh.write("\n".join(proxies) + "\n")
-    return tmp
+SOLVER_PROXY_FILE = "_solver_proxies.txt"
+
+
+def build_proxy_file(proxies: list[str]) -> str:
+    """Write proxies to solver proxy file and return the path.
+
+    Always returns the path so the solver can hot-reload when new proxies
+    are appended later.
+    """
+    with open(SOLVER_PROXY_FILE, "w") as fh:
+        if proxies:
+            fh.write("\n".join(proxies) + "\n")
+    return SOLVER_PROXY_FILE
+
+
+def sync_harvested_to_solver():
+    """Append harvested proxies (from proxies.txt) to the solver proxy file.
+
+    Converts ``user:pass:host:port`` → ``host:port@user:pass`` format that
+    the solver's ProxyProvider expects.  The provider auto-reloads on change.
+    """
+    if not os.path.exists(PROXIES_OUTPUT):
+        return
+    with open(PROXIES_OUTPUT, "r") as fh:
+        lines = [l.strip() for l in fh if l.strip()]
+    if not lines:
+        return
+
+    converted = []
+    for line in lines:
+        parts = line.split(":")
+        if len(parts) == 4:
+            user, pwd, host, port = parts
+            converted.append(f"{host}:{port}@{user}:{pwd}")
+        else:
+            converted.append(line)
+
+    with open(SOLVER_PROXY_FILE, "w") as fh:
+        fh.write("\n".join(converted) + "\n")
+    print(f"=> Synced {len(converted)} harvested proxies to solver")
 
 
 # ── Raw Proxy API Server ────────────────────────────────────────────────────
@@ -172,15 +204,13 @@ def _start_proxy_api():
 
 
 # ── Solver Server ───────────────────────────────────────────────────────────
-def _start_solver_server(proxies_file: str | None = None) -> None:
+def _start_solver_server(proxies_file: str) -> None:
     """Entry-point for the solver subprocess."""
     from turnstile_solver.main import run_server
     from turnstile_solver.proxy_provider import ProxyProvider
 
-    proxy_provider = None
-    if proxies_file:
-        proxy_provider = ProxyProvider(proxies_file)
-        proxy_provider.load()
+    proxy_provider = ProxyProvider(proxies_file)
+    proxy_provider.load()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -351,9 +381,10 @@ def main() -> None:
     proxy_file = build_proxy_file(proxies)
 
     # Start the turnstile solver server in a background process
+    # (proxy_file always exists; solver hot-reloads when harvested proxies arrive)
     solver_proc = multiprocessing.Process(
         target=_start_solver_server,
-        kwargs={"proxies_file": proxy_file},
+        args=(proxy_file,),
         daemon=True,
     )
     solver_proc.start()
@@ -394,6 +425,8 @@ def main() -> None:
             if create_account(token, req_proxy=req_proxy):
                 created += 1
                 print(f"=> Total accounts created: {created}")
+                # Feed harvested proxies back to the solver browser
+                sync_harvested_to_solver()
             else:
                 failed += 1
 
