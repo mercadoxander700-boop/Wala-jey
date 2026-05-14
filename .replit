@@ -1,0 +1,9 @@
+run = "pip install -r requirements.txt && patchright install chromium && python go.py"
+entrypoint = "go.py"
+
+[deployment]
+run = ["sh", "-c", "python go.py"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80
