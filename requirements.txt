@@ -1,0 +1,9 @@
+requests
+urllib3
+patchright
+quart
+rich
+rich_argparse
+python-dotenv
+faker
+pyngrok
