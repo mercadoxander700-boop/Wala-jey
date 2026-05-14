@@ -196,6 +196,8 @@ class TurnstileSolverServer:
       return self._error(str(ex))
 
   async def _before_request(self):
+    if request.method == "OPTIONS":
+      return
     if request.headers.get('secret') != self.secret:
       logging.error("Forbidden")
       return self._error("Who are you?", 403, "Forbidden")

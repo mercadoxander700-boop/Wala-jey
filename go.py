@@ -1,15 +1,11 @@
 import asyncio
+import multiprocessing
 import os
 import random
-import threading
 import time
 
 import requests
 import urllib3
-
-from turnstile_solver.main import run_server
-from turnstile_solver.proxy import Proxy
-from turnstile_solver.proxy_provider import ProxyProvider
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -19,7 +15,7 @@ SOLVER_PORT = 8088
 SOLVER_SECRET = "jWRN7DH6"
 
 GOLOGIN_API = "https://api.gologin.com"
-SITE_URL = "https://app.gologin.com/sign_up"
+SITE_URL = "https://captcha.gologin.com"
 SITE_KEY = "0x4AAAAAAAQn-wN8S1gi-nJa"
 
 FINGERPRINT = {
@@ -88,21 +84,27 @@ def load_proxies() -> list[str]:
     return [line.strip() for line in content.splitlines() if line.strip()]
 
 
-def build_proxy_provider(proxies: list[str]) -> ProxyProvider | None:
-    """Write proxies to a temp file and build a ``ProxyProvider``."""
+def build_proxy_file(proxies: list[str]) -> str | None:
+    """Write proxies to a temp file and return the path."""
     if not proxies:
         return None
     tmp = "_proxies_loaded.txt"
     with open(tmp, "w") as fh:
         fh.write("\n".join(proxies) + "\n")
-    provider = ProxyProvider(tmp)
-    provider.load()
-    return provider
+    return tmp
 
 
 # ── Solver Server ───────────────────────────────────────────────────────────
-def _start_solver_server(proxy_provider: ProxyProvider | None = None,
-                         proxy: Proxy | None = None) -> None:
+def _start_solver_server(proxies_file: str | None = None) -> None:
+    """Entry-point for the solver subprocess."""
+    from turnstile_solver.main import run_server
+    from turnstile_solver.proxy_provider import ProxyProvider
+
+    proxy_provider = None
+    if proxies_file:
+        proxy_provider = ProxyProvider(proxies_file)
+        proxy_provider.load()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -111,10 +113,10 @@ def _start_solver_server(proxy_provider: ProxyProvider | None = None,
                 host=SOLVER_HOST,
                 port=SOLVER_PORT,
                 secret=SOLVER_SECRET,
-                headless=True,
+                headless=False,
+                browser="chromium",
                 browser_position=(2000, 2000),
                 proxy_provider=proxy_provider,
-                proxy=proxy,
             )
         )
     except Exception as exc:
@@ -247,7 +249,7 @@ def create_account(captcha_token: str) -> bool:
             if bearer:
                 get_proxies_from_gologin(bearer)
             return True
-        print(f"=> Account creation failed [{resp.status_code}]")
+        print(f"=> Account creation failed [{resp.status_code}]: {resp.text[:500]}")
         return False
     except Exception as exc:
         print(f"=> Account creation error: {exc}")
@@ -261,15 +263,15 @@ def main() -> None:
     if proxies:
         print(f"=> Loaded {len(proxies)} proxies from {PROXY_FILE}")
 
-    proxy_provider = build_proxy_provider(proxies)
+    proxy_file = build_proxy_file(proxies)
 
-    # Start the turnstile solver server in a background thread
-    solver_thread = threading.Thread(
+    # Start the turnstile solver server in a background process
+    solver_proc = multiprocessing.Process(
         target=_start_solver_server,
-        kwargs={"proxy_provider": proxy_provider},
+        kwargs={"proxies_file": proxy_file},
         daemon=True,
     )
-    solver_thread.start()
+    solver_proc.start()
 
     if not wait_for_solver():
         print("=> Exiting: solver server not available")

@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 import time
@@ -52,7 +53,7 @@ BROWSER_ARGS = {
   '--disable-breakpad',
   # Allow Manifest V2 extensions
   # --disable-features=ExtensionManifestV2DeprecationWarning,ExtensionManifestV2Disabled,ExtensionManifestV2Unsupported
-  '--disable-features=OptimizationHints,OptimizationHintsFetching,Translate,OptimizationTargetPrediction,OptimizationGuideModelDownloading,DownloadBubble,DownloadBubbleV2,InsecureDownloadWarnings,InterestFeedContentSuggestions,PrivacySandboxSettings4,SidePanelPinning,UserAgentClientHint',
+  '--disable-features=OptimizationHints,OptimizationHintsFetching,Translate,OptimizationTargetPrediction,OptimizationGuideModelDownloading,DownloadBubble,DownloadBubbleV2,InsecureDownloadWarnings,InterestFeedContentSuggestions,PrivacySandboxSettings4,SidePanelPinning,UserAgentClientHint,TrustedDOMTypes,BlockInsecurePrivateNetworkRequests',
   '--no-pings',
   # '--homepage=chrome://version/',
   '--animation-duration-scale=0',
@@ -199,14 +200,26 @@ class TurnstileSolver:
 
         result.page = page
 
-        # 2. Wait for init event
+        # 2. Wait for init event (with fallback for newer Chromium)
         logger.debug(f"Waiting for '{CaptchaApiMessageEvent.INIT.value}' event")
         try:
           if await result.wait_for_captcha_event(evt=CaptchaApiMessageEvent.INIT, timeout=timeout) is False:
             return
-        except TimeoutError as te:
-          self._error = te.args[0]
-          logger.warning(f"Captcha API message '{CaptchaApiMessageEvent.INIT.value}' event not received within {timeout} seconds")
+        except TimeoutError:
+          logger.warning(f"Captcha API message '{CaptchaApiMessageEvent.INIT.value}' event not received within {timeout} seconds, trying direct solve")
+          # Fallback: try clicking checkbox and polling for token directly
+          try:
+            await result.click_checkbox()
+          except Exception:
+            pass
+          token_val = await self._poll_token(page, timeout=timeout)
+          if token_val:
+            result.token = token_val
+            elapsed = datetime.timedelta(seconds=time.time() - startTime)
+            logger.info(f"Captcha solved via direct poll. Elapsed: {str(elapsed).split('.')[0]}")
+            result.elapsed = elapsed
+            break
+          self._error = f"Captcha event '{CaptchaApiMessageEvent.INIT.value}' not received within {timeout} seconds"
           continue
 
         if self._server_down:
@@ -255,6 +268,29 @@ class TurnstileSolver:
       for callback in onFinishCallbacks:
         await callback()
 
+  async def _poll_token(self, page: Page, timeout: float = 30, interval: float = 0.5) -> str | None:
+    """Poll the page for a solved Turnstile token value."""
+    end_time = time.time() + timeout
+    click_attempted = False
+    while time.time() < end_time:
+      try:
+        token = await page.evaluate(
+          "document.querySelector('[name=cf-turnstile-response]')?.value || ''"
+        )
+        if token:
+          return token
+        # Try clicking the checkbox periodically
+        if not click_attempted or int(time.time()) % 5 == 0:
+          try:
+            await page.locator('.cf-turnstile').click(timeout=1000)
+            click_attempted = True
+          except Exception:
+            pass
+      except Exception:
+        pass
+      await asyncio.sleep(interval)
+    return None
+
   async def _setup_page(
       self,
       page_or_context: BrowserContext | Page,
@@ -275,7 +311,18 @@ class TurnstileSolver:
       id=id,
       secret=self.server.secret,
     )
-    await page.route(site_url, lambda r: r.fulfill(body=pageContent, status=200))
+
+    async def _fulfill(route):
+      await route.fulfill(
+        body=pageContent,
+        status=200,
+        headers={
+          "Content-Type": "text/html; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+        },
+      )
+
+    await page.route(site_url, _fulfill)
 
     if page.url != site_url:
       logger.debug(f"Navigating to URL: {site_url}")
@@ -283,6 +330,29 @@ class TurnstileSolver:
     else:
       logger.debug("Reloading page")
       await page.reload(timeout=self.page_load_timeout * 1000)
+
+    # Inject the message forwarder via evaluate to bypass CSP restrictions
+    callback_js = """() => {{
+      if (window.__turnstileListenerAdded) return;
+      window.__turnstileListenerAdded = true;
+      window.addEventListener("message", m => {{
+        if (m.origin !== "https://challenges.cloudflare.com" || !!m.data === false) return;
+        fetch("http://127.0.0.1:{port}/{endpoint}?id={id}", {{
+          method: "POST",
+          body: JSON.stringify(m.data),
+          headers: {{
+            "Content-type": "application/json; charset=UTF-8",
+            "Secret": "{secret}",
+          }},
+        }}).catch(e => console.error("Callback error:", e));
+      }});
+    }}""".format(
+      port=self.server.port,
+      endpoint=CAPTCHA_EVENT_CALLBACK_ENDPOINT.lstrip('/'),
+      id=id,
+      secret=self.server.secret,
+    )
+    await page.evaluate(callback_js)
 
     page.window_width = await page.evaluate("window.innerWidth")
     page.window_height = await page.evaluate("window.innerHeight")
