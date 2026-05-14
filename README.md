@@ -43,11 +43,33 @@ python go.py
 
 The script will:
 
-1. Read `proxy.txt` -- if it contains a URL, proxies are fetched from that API.
-2. Start the Turnstile solver server in the background (headless Chromium).
-3. Solve the GoLogin sign-up captcha.
-4. Create a new GoLogin account and save credentials to `accounts.txt`.
-5. Fetch proxies from the new account and append to `proxies.txt`.
+1. Start a **raw proxy API server** on port 5000.
+2. Read `proxy.txt` -- if it contains a URL, proxies are fetched from that API.
+3. Start the Turnstile solver server in the background (Chromium).
+4. Solve the GoLogin sign-up captcha.
+5. Create a new GoLogin account and save credentials to `accounts.txt`.
+6. Fetch proxies from the new account and append to `proxies.txt`.
+7. Keep running so harvested proxies stay accessible via the API.
+
+## Raw Proxy API
+
+After running `go.py`, harvested proxies are served as raw text via HTTP:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /proxies` | Harvested proxies from GoLogin (`user:pass:host:port`, one per line) |
+| `GET /accounts` | Created accounts (`email:password`, one per line) |
+
+**Example:** If running on Replit at `https://your-repl.repl.co`, use:
+```
+https://your-repl.repl.co/proxies
+```
+as a raw API proxy link in any other tool. The proxies update live as new accounts are created.
+
+**Local:**
+```
+http://localhost:5000/proxies
+```
 
 ## Output files
 

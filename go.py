@@ -2,7 +2,9 @@ import asyncio
 import multiprocessing
 import os
 import random
+import threading
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 import urllib3
@@ -33,6 +35,8 @@ UA = (
 )
 
 PROXY_FILE = "proxy.txt"
+PROXIES_OUTPUT = "proxies.txt"
+API_PORT = 5000
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -92,6 +96,53 @@ def build_proxy_file(proxies: list[str]) -> str | None:
     with open(tmp, "w") as fh:
         fh.write("\n".join(proxies) + "\n")
     return tmp
+
+
+# ── Raw Proxy API Server ────────────────────────────────────────────────────
+class _ProxyAPIHandler(BaseHTTPRequestHandler):
+    """Serves harvested proxies as raw text at /proxies."""
+
+    def do_GET(self):
+        if self.path == "/proxies" or self.path == "/proxies/":
+            if os.path.exists(PROXIES_OUTPUT):
+                with open(PROXIES_OUTPUT, "r") as fh:
+                    content = fh.read()
+            else:
+                content = ""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content.encode())
+        elif self.path == "/accounts" or self.path == "/accounts/":
+            if os.path.exists("accounts.txt"):
+                with open("accounts.txt", "r") as fh:
+                    content = fh.read()
+            else:
+                content = ""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content.encode())
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(
+                b"Wala-jey Proxy API\n"
+                b"  GET /proxies  - harvested proxies (raw text)\n"
+                b"  GET /accounts - created accounts (raw text)\n"
+            )
+
+    def log_message(self, format, *args):
+        pass  # suppress noisy request logs
+
+
+def _start_proxy_api():
+    server = HTTPServer(("0.0.0.0", API_PORT), _ProxyAPIHandler)
+    print(f"=> Proxy API server running on http://0.0.0.0:{API_PORT}/proxies")
+    server.serve_forever()
 
 
 # ── Solver Server ───────────────────────────────────────────────────────────
@@ -258,6 +309,10 @@ def create_account(captcha_token: str) -> bool:
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main() -> None:
+    # Start the raw proxy API server so harvested proxies can be fetched
+    api_thread = threading.Thread(target=_start_proxy_api, daemon=True)
+    api_thread.start()
+
     # Load proxies (supports raw API URL in proxy.txt)
     proxies = load_proxies()
     if proxies:
@@ -288,6 +343,15 @@ def main() -> None:
         print("=> Done!")
     else:
         print("=> Failed to create account")
+
+    # Keep the proxy API server running so proxies stay accessible
+    print(f"=> Proxy API still running at http://0.0.0.0:{API_PORT}/proxies")
+    print("=> Press Ctrl+C to stop")
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n=> Shutting down")
 
 
 if __name__ == "__main__":
