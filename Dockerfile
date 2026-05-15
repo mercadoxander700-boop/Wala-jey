@@ -35,13 +35,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install bundled Chromium for Patchright
 RUN patchright install chromium
 
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
 COPY . .
 
 # Railway sets PORT env var; default to 5000
 ENV PORT=5000
 
-# Start Xvfb virtual framebuffer on display :99, then launch the app.
-# The DISPLAY env var tells Chromium where to find the X server;
-# if Xvfb isn't running (e.g. local dev), the app falls back to headless mode.
+# Tell the app it's running in Docker / headless environment.
+# HEADLESS_MODE=1 forces headless browser mode.
+# DISPLAY=:99 tells Xvfb where to create the virtual display.
+ENV HEADLESS_MODE=1
 ENV DISPLAY=:99
-CMD Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &\n    sleep 1 &&\n    python go.py
+
+ENTRYPOINT ["./entrypoint.sh"]

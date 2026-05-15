@@ -417,11 +417,17 @@ class TurnstileSolver:
     # Turnstile, causing every solve attempt to fail.
     headless_mode = "new" if self.headless else False
 
+    # When using headless mode, avoid specifying a channel — patchright's
+    # bundled Chromium is guaranteed to work.  Specifying a channel (e.g.
+    # "chromium") can cause launch failures in Docker/Railway where a
+    # system Chromium may not be installed at the expected path.
+    channel = self.browser if not self.headless else None
+
     # ?
     # browser: Browser | None = await playwright.chromium.launch_persistent_context(no_viewport=True)
     browser: Browser | None = await playwright.chromium.launch(
       executable_path=self.browser_executable_path,
-      channel=self.browser,
+      channel=channel,
       args=self.browser_args,
       headless=headless_mode,
       proxy=proxy.dict() if proxy else None,
@@ -449,17 +455,14 @@ class TurnstileSolver:
     )
 
     # Anti-detection: override navigator.webdriver so Cloudflare can't
-    # trivially flag the browser as automated.
+    # trivially flag the browser as automated.  These overrides must run
+    # before any page scripts execute (add_init_script guarantees this).
     await context.add_init_script("""
+      // Hide webdriver flag
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       // Patch chrome runtime to look like a real browser
-      window.chrome = { runtime: {} };
-      // Override permissions query
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) =>
-        parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : originalQuery(parameters);
+      if (!window.chrome) { window.chrome = {}; }
+      if (!window.chrome.runtime) { window.chrome.runtime = {}; }
       // Fake plugins length (headless has 0, normal has 5+)
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5],

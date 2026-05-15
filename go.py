@@ -51,8 +51,16 @@ DELAY_BETWEEN_ACCOUNTS = 5  # seconds between account creation cycles
 MAX_CONSECUTIVE_FAILURES = 10  # restart solver after this many failures in a row
 SOLVER_PROXY_FILE = "_solver_proxies.txt"
 
-# Auto-detect headless mode: Railway / Docker / CI have no display
-HEADLESS = not os.environ.get("DISPLAY")
+# Auto-detect headless mode:
+# - HEADLESS_MODE env var takes precedence (set to "1" or "0" explicitly).
+#   The Dockerfile sets HEADLESS_MODE=1.
+# - Otherwise, auto-detect: no real display means headless.
+HEADLESS = os.environ.get("HEADLESS_MODE", "").lower() in ("1", "true", "yes")
+if not HEADLESS and not os.environ.get("HEADLESS_MODE"):
+    # Fallback auto-detect: if no DISPLAY at all, or only virtual :99
+    display = os.environ.get("DISPLAY", "")
+    if not display:
+        HEADLESS = True
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -293,6 +301,7 @@ def _start_solver_server(proxies_file: str) -> None:
     except Exception as exc:
         print(f"=> Solver server error: {exc}")
         traceback.print_exc()
+        sys.exit(1)
 
 
 def start_solver_process(proxy_file: str) -> multiprocessing.Process:
@@ -303,6 +312,7 @@ def start_solver_process(proxy_file: str) -> multiprocessing.Process:
         daemon=True,
     )
     proc.start()
+    print(f"=> Solver subprocess started (PID: {proc.pid})")
     return proc
 
 
