@@ -37,30 +37,65 @@ HTML_TEMPLATE = '''
             return origin === "https://challenges.cloudflare.com";
           }}
 
+          // Track message delivery to avoid duplicates
+          const deliveredEvents = new Set();
+
           window.addEventListener("message", (m) => {{
             if (!isAllowedOrigin(m.origin)) return;
             const payload = normalizePayload(m.data);
             if (!payload || typeof payload.event !== "string") return;
 
+            // Avoid duplicate event delivery
+            const eventKey = payload.event + "_" + (payload.timestamp || Date.now());
+            if (deliveredEvents.has(eventKey)) return;
+            deliveredEvents.add(eventKey);
+
+            // Clean up old event keys (keep last 100)
+            if (deliveredEvents.size > 100) {{
+              const keys = Array.from(deliveredEvents);
+              deliveredEvents.clear();
+              keys.slice(-50).forEach(k => deliveredEvents.add(k));
+            }}
+
             // Preferred path: Playwright/patchright bridge (avoids mixed-content blocks
             // when the page is on an HTTPS origin).
+            let bridgeSuccess = false;
             try {{
               if (typeof window.__turnstileSolverCallback === "function") {{
                 window.__turnstileSolverCallback(payload);
+                bridgeSuccess = true;
                 return;
               }}
             }} catch (e) {{
-              // Fall back to HTTP callback below.
+              console.warn("Bridge callback failed:", e);
             }}
 
             // Fallback: HTTP callback to the local solver server.
-            fetch("http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}", {{
+            // Use navigator.sendBeacon for better reliability, fall back to fetch
+            const httpUrl = "http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}";
+            const httpPayload = JSON.stringify(payload);
+
+            try {{
+              // Try sendBeacon first (more reliable for page unload scenarios)
+              if (navigator.sendBeacon) {{
+                const blob = new Blob([httpPayload], {{ type: "application/json" }});
+                if (navigator.sendBeacon(httpUrl, blob)) {{
+                  return;
+                }}
+              }}
+            }} catch (e) {{
+              console.warn("sendBeacon failed:", e);
+            }}
+
+            // Fall back to fetch
+            fetch(httpUrl, {{
               method: "POST",
-              body: JSON.stringify(payload),
+              body: httpPayload,
               headers: {{
                 "Content-type": "application/json; charset=UTF-8",
                 Secret: "{secret}",
               }},
+              keepalive: true,
             }}).catch((e) => console.error("Error sending message to local server:", e));
           }});
         }})();

@@ -178,7 +178,7 @@ class TurnstileSolverServer:
     pool_status = "not_initialized"
     if self.browser_context_pool is not None:
       try:
-        pool_status = f"ready (contexts={len(self.browser_context_pool.in_use) + len(self.browser_context_pool.available)})"
+        pool_status = f"ready (contexts={len(self.browser_context_pool.in_use) + len(self.browser_context_pool._available)})"
       except Exception:
         pool_status = "initializing"
     return self._ok({

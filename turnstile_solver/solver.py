@@ -313,31 +313,51 @@ class TurnstileSolver:
     """Poll the page for a solved Turnstile token value."""
     end_time = time.time() + timeout
     click_attempted = False
+    iframe_click_attempted = False
+    last_click_time = 0
+
     while time.time() < end_time:
       try:
+        # Check for token in multiple possible locations
         token = await page.evaluate(
-          "document.querySelector('[name=cf-turnstile-response]')?.value || ''"
+          "document.querySelector('[name=cf-turnstile-response]')?.value || "
+          "document.querySelector('textarea[name=cf-turnstile-response]')?.value || "
+          "''"
         )
-        if token:
+        if token and len(token) > 10:  # Valid tokens are typically longer
+          logger.debug(f"Token found: {token[:30]}...")
           return token
+
+        current_time = time.time()
+
         # Try clicking the checkbox periodically — in headless mode the widget
         # sometimes needs an explicit click to trigger the challenge flow.
-        if not click_attempted or int(time.time()) % 3 == 0:
+        # Click more frequently in headless mode
+        if not click_attempted or (current_time - last_click_time > 2):
           try:
             # First try the outer container
             await page.locator('.cf-turnstile').click(timeout=1500)
             click_attempted = True
-          except Exception:
+            last_click_time = current_time
+            logger.debug("Clicked Turnstile widget (outer container)")
+          except Exception as e:
+            logger.debug(f"Outer container click failed: {e}")
             try:
               # Fallback: click inside the iframe if present
-              iframe = page.frame_locator('iframe[title*="Cloudflare"]')
-              await iframe.locator('body').click(timeout=1000)
-              click_attempted = True
-            except Exception:
-              pass
-      except Exception:
-        pass
+              if not iframe_click_attempted or (current_time - last_click_time > 3):
+                iframe = page.frame_locator('iframe[title*="Cloudflare"]')
+                await iframe.locator('body').click(timeout=1000)
+                iframe_click_attempted = True
+                last_click_time = current_time
+                logger.debug("Clicked Turnstile widget (iframe)")
+            except Exception as iframe_e:
+              logger.debug(f"Iframe click failed: {iframe_e}")
+      except Exception as e:
+        logger.debug(f"Token poll error: {e}")
+
       await asyncio.sleep(interval)
+
+    logger.warning(f"Token not found after {timeout}s")
     return None
 
   async def _setup_page(
@@ -395,6 +415,14 @@ class TurnstileSolver:
     else:
       logger.debug("Reloading page")
       await page.reload(timeout=self.page_load_timeout * 1000)
+
+    # Wait for the Turnstile widget to be present in the DOM.
+    # In headless mode, the widget may take a moment to render.
+    try:
+      await page.wait_for_selector('.cf-turnstile', timeout=10000)
+      logger.debug("Turnstile widget found in DOM")
+    except Exception as e:
+      logger.warning(f"Turnstile widget not found after 10s: {e}")
 
     page.window_width = await page.evaluate("window.innerWidth")
     page.window_height = await page.evaluate("window.innerHeight")
@@ -467,6 +495,11 @@ class TurnstileSolver:
 
     if not browser:
       browser, playwright = await self.get_browser(playwright=playwright, proxy=proxy)
+    elif not playwright:
+      # If a browser was provided but no playwright, we need to create one
+      # so that the caller can properly shut it down later.
+      logger.warning("Browser provided without Playwright instance — creating a new Playwright")
+      playwright = await async_playwright().start()
 
     context = await browser.new_context(
       proxy=proxy.dict() if proxy else None,

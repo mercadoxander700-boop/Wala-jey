@@ -62,7 +62,11 @@ class Pool:
     self._available.append(self.in_use.pop(index))
 
   async def _get_item(self):
-    item = self._item_getter()
-    if isawaitable(item):
-      item = await item
-    return item
+    try:
+      item = self._item_getter()
+      if isawaitable(item):
+        item = await item
+      return item
+    except Exception as exc:
+      logger.error(f"Error creating new pool item: {exc}")
+      raise

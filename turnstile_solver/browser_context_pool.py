@@ -43,7 +43,7 @@ class BrowserContextPool(Pool):
   async def init(self):
     logger.info("BrowserContextPool.init() — launching first browser instance …")
     try:
-      self._browser, _ = await self._solver.get_browser(None)
+      self._browser, self._playwright = await self._solver.get_browser(None)
       logger.info(f"BrowserContextPool.init() — browser launched: {self._browser}")
     except Exception as exc:
       logger.error(f"BrowserContextPool.init() — browser launch FAILED: {exc}")
@@ -62,7 +62,33 @@ class BrowserContextPool(Pool):
           # logger.debug(f"Reusing PagePool (size = {pool.size})")
           return pool
       # logger.debug("Getting PagePool from pool manager")
-      return await super().get()
+      try:
+        return await super().get()
+      except Exception as exc:
+        # If browser crashed, try to relaunch it
+        if "has been closed" in str(exc) or "Target closed" in str(exc) or "Session closed" in str(exc):
+          logger.warning(f"Browser appears to have crashed: {exc}. Attempting to relaunch...")
+          try:
+            # Close old browser and playwright if they exist
+            if self._browser and not self._browser.is_connected():
+              try:
+                await self._browser.close()
+              except Exception:
+                pass
+            if self._playwright:
+              try:
+                await self._playwright.stop()
+              except Exception:
+                pass
+            # Launch new browser
+            self._browser, self._playwright = await self._solver.get_browser(None)
+            logger.info(f"Browser relaunched successfully: {self._browser}")
+            # Retry getting the page pool
+            return await super().get()
+          except Exception as relaunch_exc:
+            logger.error(f"Failed to relaunch browser: {relaunch_exc}")
+            raise RuntimeError(f"Browser crashed and relaunch failed: {relaunch_exc}")
+        raise
 
   async def _page_pool_getter(self):
     proxy = self._proxy_provider.get() if self._proxy_provider else None
