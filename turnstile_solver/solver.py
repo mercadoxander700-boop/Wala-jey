@@ -51,6 +51,15 @@ BROWSER_ARGS = {
   '--disable-password-generation',
   '--disable-domain-reliability',
   '--disable-breakpad',
+
+  # Headless-mode essentials – these flags ensure the Turnstile widget
+  # renders correctly and the page content is fully laid out even when
+  # there is no physical display (Railway / Docker / CI).
+  '--disable-gpu',                       # avoid GPU-related crashes in containers
+  '--disable-software-rasterizer',        # redundant safety for GPU disable
+  '--window-size=1920,1080',              # explicit viewport so widget paints fully
+  '--hide-scrollbars',                    # clean screenshots / rendering
+
   # Allow Manifest V2 extensions
   # --disable-features=ExtensionManifestV2DeprecationWarning,ExtensionManifestV2Disabled,ExtensionManifestV2Unsupported
   '--disable-features=OptimizationHints,OptimizationHintsFetching,Translate,OptimizationTargetPrediction,OptimizationGuideModelDownloading,DownloadBubble,DownloadBubbleV2,InsecureDownloadWarnings,InterestFeedContentSuggestions,PrivacySandboxSettings4,SidePanelPinning,UserAgentClientHint,TrustedDOMTypes,BlockInsecurePrivateNetworkRequests',
@@ -311,13 +320,21 @@ class TurnstileSolver:
         )
         if token:
           return token
-        # Try clicking the checkbox periodically
-        if not click_attempted or int(time.time()) % 5 == 0:
+        # Try clicking the checkbox periodically — in headless mode the widget
+        # sometimes needs an explicit click to trigger the challenge flow.
+        if not click_attempted or int(time.time()) % 3 == 0:
           try:
-            await page.locator('.cf-turnstile').click(timeout=1000)
+            # First try the outer container
+            await page.locator('.cf-turnstile').click(timeout=1500)
             click_attempted = True
           except Exception:
-            pass
+            try:
+              # Fallback: click inside the iframe if present
+              iframe = page.frame_locator('iframe[title*="Cloudflare"]')
+              await iframe.locator('body').click(timeout=1000)
+              click_attempted = True
+            except Exception:
+              pass
       except Exception:
         pass
       await asyncio.sleep(interval)
@@ -394,13 +411,19 @@ class TurnstileSolver:
     if not playwright:
       playwright = await async_playwright().start()
 
+    # Use headless="new" for the modern headless mode that shares the same
+    # rendering engine as headed Chromium.  The old headless=True mode uses a
+    # separate (limited) renderer that is trivially detected by Cloudflare
+    # Turnstile, causing every solve attempt to fail.
+    headless_mode = "new" if self.headless else False
+
     # ?
     # browser: Browser | None = await playwright.chromium.launch_persistent_context(no_viewport=True)
     browser: Browser | None = await playwright.chromium.launch(
       executable_path=self.browser_executable_path,
       channel=self.browser,
       args=self.browser_args,
-      headless=self.headless,
+      headless=headless_mode,
       proxy=proxy.dict() if proxy else None,
     )
     return browser, playwright
@@ -416,8 +439,36 @@ class TurnstileSolver:
 
     context = await browser.new_context(
       proxy=proxy.dict() if proxy else None,
-      no_viewport=True,
+      viewport={"width": 1920, "height": 1080},
+      no_viewport=False,
+      user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+      ),
     )
+
+    # Anti-detection: override navigator.webdriver so Cloudflare can't
+    # trivially flag the browser as automated.
+    await context.add_init_script("""
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      // Patch chrome runtime to look like a real browser
+      window.chrome = { runtime: {} };
+      // Override permissions query
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
+      // Fake plugins length (headless has 0, normal has 5+)
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+      });
+      // Fake languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+      });
+    """)
 
     # await context.route('**', lambda route: route.continue_())
     # await context.set_extra_http_headers({'HTTP2-Settings': 'MAX_CONCURRENT_STREAMS=100'})

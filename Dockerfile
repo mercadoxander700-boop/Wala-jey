@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Install Chromium dependencies required by Playwright/Patchright
+# Install Chromium dependencies + Xvfb for virtual display
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libnspr4 \
@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 \
     libxext6 \
     fonts-liberation \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -39,4 +40,8 @@ COPY . .
 # Railway sets PORT env var; default to 5000
 ENV PORT=5000
 
-CMD ["python", "go.py"]
+# Start Xvfb virtual framebuffer on display :99, then launch the app.
+# The DISPLAY env var tells Chromium where to find the X server;
+# if Xvfb isn't running (e.g. local dev), the app falls back to headless mode.
+ENV DISPLAY=:99
+CMD Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &\n    sleep 1 &&\n    python go.py

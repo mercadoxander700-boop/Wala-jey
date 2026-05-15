@@ -264,7 +264,17 @@ def _start_solver_server(proxies_file: str) -> None:
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        extra_args = ["--disable-gpu"] if HEADLESS else []
+
+        # Critical headless args for Railway/Docker:
+        # - --disable-gpu: avoid GPU crashes in containers
+        # - --window-size: ensure widget renders correctly
+        # - --hide-scrollbars: cleaner rendering
+        extra_args = [
+            "--disable-gpu",
+            "--window-size=1920,1080",
+            "--hide-scrollbars",
+        ] if HEADLESS else []
+
         loop.run_until_complete(
             run_server(
                 host=SOLVER_HOST,
@@ -276,6 +286,7 @@ def _start_solver_server(proxies_file: str) -> None:
                 proxy_provider=proxy_provider,
                 max_attempts=5,
                 attempt_timeout=30,
+                page_load_timeout=30,
                 browser_args=extra_args,
             )
         )
