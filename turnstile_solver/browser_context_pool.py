@@ -41,7 +41,13 @@ class BrowserContextPool(Pool):
     return self._browser
 
   async def init(self):
-    self._browser, _ = await self._solver.get_browser(None)
+    logger.info("BrowserContextPool.init() — launching first browser instance …")
+    try:
+      self._browser, _ = await self._solver.get_browser(None)
+      logger.info(f"BrowserContextPool.init() — browser launched: {self._browser}")
+    except Exception as exc:
+      logger.error(f"BrowserContextPool.init() — browser launch FAILED: {exc}")
+      raise
 
   async def get(self) -> PagePool:
 

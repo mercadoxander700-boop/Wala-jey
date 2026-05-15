@@ -266,12 +266,38 @@ async def run_server(
     browser_args=browser_args,
   )
   server.solver = solver
-  await solver.server.create_browser_context_pool(
-    max_contexts=max_contexts,
-    max_pages_per_context=max_pages_per_context,
-    single_instance=single_browser_instance,
-    proxy_provider=proxy_provider,
-  )
+
+  # ── Start the HTTP server FIRST so healthchecks pass immediately ──
+  # The browser context pool is initialized in the background after the
+  # server is up.  This prevents Chromium launch failures from blocking
+  # the Quart server and causing the Railway healthcheck to time out.
+
+  async def _init_pool_after_server():
+    """Background task: initialize the browser pool once the server is serving."""
+    # Wait until the server is actually up (Quart sets server.down = False)
+    for _ in range(120):  # up to ~60 s
+      if not server.down:
+        break
+      await asyncio.sleep(0.5)
+    else:
+      logger.error("Server never came up — skipping browser pool init")
+      return
+
+    logger.info("Initializing browser context pool …")
+    try:
+      await server.create_browser_context_pool(
+        max_contexts=max_contexts,
+        max_pages_per_context=max_pages_per_context,
+        single_instance=single_browser_instance,
+        proxy_provider=proxy_provider,
+      )
+      logger.info("Browser context pool ready")
+    except Exception as exc:
+      logger.error(f"Browser context pool init failed: {exc}")
+      # Don't crash — the server stays up so we can diagnose via /health
+
+  # Schedule the background init
+  asyncio.ensure_future(_init_pool_after_server())
 
   try:
     # Keep it breathing

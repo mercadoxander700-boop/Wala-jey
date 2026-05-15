@@ -423,15 +423,39 @@ class TurnstileSolver:
     # system Chromium may not be installed at the expected path.
     channel = self.browser if not self.headless else None
 
-    # ?
-    # browser: Browser | None = await playwright.chromium.launch_persistent_context(no_viewport=True)
-    browser: Browser | None = await playwright.chromium.launch(
-      executable_path=self.browser_executable_path,
-      channel=channel,
-      args=self.browser_args,
-      headless=headless_mode,
-      proxy=proxy.dict() if proxy else None,
-    )
+    logger.info(f"Launching browser: headless={headless_mode}, channel={channel}, "
+                f"executable_path={self.browser_executable_path}, "
+                f"args_count={len(self.browser_args)}")
+    logger.debug(f"Browser args: {self.browser_args}")
+
+    try:
+      browser: Browser | None = await playwright.chromium.launch(
+        executable_path=self.browser_executable_path,
+        channel=channel,
+        args=self.browser_args,
+        headless=headless_mode,
+        proxy=proxy.dict() if proxy else None,
+      )
+    except Exception as launch_err:
+      logger.error(f"Browser launch failed: {launch_err}")
+      # Try once more without a channel as fallback
+      if channel is not None:
+        logger.info("Retrying browser launch without channel...")
+        try:
+          browser = await playwright.chromium.launch(
+            executable_path=self.browser_executable_path,
+            channel=None,
+            args=self.browser_args,
+            headless=headless_mode,
+            proxy=proxy.dict() if proxy else None,
+          )
+        except Exception as retry_err:
+          logger.error(f"Browser launch retry also failed: {retry_err}")
+          raise
+      else:
+        raise
+
+    logger.info(f"Browser launched successfully: {browser}")
     return browser, playwright
 
   async def get_browser_context(self,

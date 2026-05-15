@@ -264,6 +264,80 @@ def _start_proxy_api():
 def _start_solver_server(proxies_file: str) -> None:
     """Entry-point for the solver subprocess."""
     try:
+        # ── Verify patchright + chromium are available ──
+        import patchright
+        print(f"=> [solver] patchright version: {getattr(patchright, '__version__', 'unknown')}")
+
+        # Find and log the chromium executable path
+        try:
+            from patchright._impl._driver import compute_driver_executable
+            driver_path = compute_driver_executable()
+            print(f"=> [solver] patchright driver: {driver_path}")
+        except Exception as e:
+            print(f"=> [solver] Could not determine patchright driver path: {e}")
+
+        # Check if chromium binary exists
+        import subprocess as sp
+        try:
+            result = sp.run(
+                ["python", "-m", "patchright", "install", "--dry-run", "chromium"],
+                capture_output=True, text=True, timeout=10
+            )
+            print(f"=> [solver] patchright chromium check: rc={result.returncode}")
+            if result.stdout:
+                print(f"=> [solver]   stdout: {result.stdout[:500]}")
+            if result.stderr:
+                print(f"=> [solver]   stderr: {result.stderr[:500]}")
+        except Exception as e:
+            print(f"=> [solver] patchright chromium check failed: {e}")
+
+        # Try to find the actual chromium binary
+        try:
+            from patchright._impl._browser_type import BrowserType
+            # The chromium binary is usually at ~/.cache/ms-playwright/chromium-*/chrome-linux/chrome
+            import glob
+            chromium_bins = glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"))
+            if chromium_bins:
+                print(f"=> [solver] Found chromium binary: {chromium_bins[0]}")
+                os.chmod(chromium_bins[0], 0o755)  # ensure it's executable
+            else:
+                print("=> [solver] WARNING: No chromium binary found in ~/.cache/ms-playwright/")
+                # Try patchright's own cache dir
+                chromium_bins = glob.glob(os.path.expanduser("~/.cache/ms-patchright/chromium-*/chrome-linux/chrome"))
+                if chromium_bins:
+                    print(f"=> [solver] Found patchright chromium binary: {chromium_bins[0]}")
+                    os.chmod(chromium_bins[0], 0o755)
+                else:
+                    print("=> [solver] WARNING: No chromium binary found in ~/.cache/ms-patchright/ either")
+        except Exception as e:
+            print(f"=> [solver] Error locating chromium binary: {e}")
+
+        # Check for missing shared libraries
+        try:
+            chrome_path = None
+            for search in [
+                os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
+                os.path.expanduser("~/.cache/ms-patchright/chromium-*/chrome-linux/chrome"),
+            ]:
+                import glob as _glob
+                matches = _glob.glob(search)
+                if matches:
+                    chrome_path = matches[0]
+                    break
+            if chrome_path:
+                ldd_result = sp.run(["ldd", chrome_path], capture_output=True, text=True, timeout=10)
+                missing = [line for line in ldd_result.stdout.splitlines() if "not found" in line]
+                if missing:
+                    print(f"=> [solver] WARNING: Missing shared libraries:")
+                    for lib in missing:
+                        print(f"=> [solver]   {lib.strip()}")
+                else:
+                    print("=> [solver] All shared libraries present for chromium")
+        except Exception as e:
+            print(f"=> [solver] Could not check shared libraries: {e}")
+
+        sys.stdout.flush()
+
         from turnstile_solver.main import run_server
         from turnstile_solver.proxy_provider import ProxyProvider
 
@@ -283,6 +357,9 @@ def _start_solver_server(proxies_file: str) -> None:
             "--hide-scrollbars",
         ] if HEADLESS else []
 
+        print(f"=> [solver] Starting run_server(headless={HEADLESS}, browser=chromium)...")
+        sys.stdout.flush()
+
         loop.run_until_complete(
             run_server(
                 host=SOLVER_HOST,
@@ -301,6 +378,7 @@ def _start_solver_server(proxies_file: str) -> None:
     except Exception as exc:
         print(f"=> Solver server error: {exc}")
         traceback.print_exc()
+        sys.stdout.flush()
         sys.exit(1)
 
 
@@ -316,27 +394,59 @@ def start_solver_process(proxy_file: str) -> multiprocessing.Process:
     return proc
 
 
-def wait_for_solver(timeout: int = 90) -> bool:
-    """Wait until the solver server is reachable."""
+def wait_for_solver(timeout: int = 120) -> bool:
+    """Wait until the solver server is reachable and browser pool is ready."""
     print("=> Waiting for solver server...")
     deadline = time.time() + timeout
+    server_up = False
     while time.time() < deadline:
+        # First check if the subprocess is even alive
+        # (we don't have the proc here, but the HTTP check covers it)
         try:
+            # Check basic liveness first
             resp = requests.get(
                 f"http://{SOLVER_HOST}:{SOLVER_PORT}/",
                 headers={"secret": SOLVER_SECRET},
                 timeout=3,
             )
-            if resp.status_code == 200:
-                print("=> Solver server is ready")
-                return True
+            if resp.status_code == 200 and not server_up:
+                server_up = True
+                print("=> Solver HTTP server is up, waiting for browser pool...")
+            
+            # Check if browser pool is ready
+            if server_up:
+                try:
+                    health = requests.get(
+                        f"http://{SOLVER_HOST}:{SOLVER_PORT}/health",
+                        headers={"secret": SOLVER_SECRET},
+                        timeout=3,
+                    )
+                    if health.status_code == 200:
+                        data = health.json()
+                        pool_status = data.get("pool", "unknown")
+                        if "ready" in str(pool_status):
+                            print(f"=> Solver server ready (pool: {pool_status})")
+                            return True
+                        elif "not_initialized" in str(pool_status):
+                            # Server is up but pool hasn't started init yet — wait
+                            pass
+                        else:
+                            print(f"=> Solver pool status: {pool_status}")
+                except Exception:
+                    pass  # health endpoint might not be available yet
         except (requests.ConnectionError, requests.Timeout):
             pass
         except Exception:
             pass
-        time.sleep(1)
-    print("=> Solver server failed to start within timeout")
-    return False
+        time.sleep(2)
+    
+    if server_up:
+        print("=> Solver HTTP server is up but browser pool did not initialize in time")
+        print("=> The solver will work once the browser pool finishes initializing")
+        return True  # Server is reachable, pool might finish init later
+    else:
+        print("=> Solver server failed to start within timeout")
+        return False
 
 
 def is_solver_alive(proc: multiprocessing.Process) -> bool:

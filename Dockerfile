@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Install Chromium dependencies + Xvfb for virtual display
+# Install Chromium dependencies + Xvfb for virtual display + fonts + debugging tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libnspr4 \
@@ -24,7 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 \
     libxext6 \
     fonts-liberation \
+    fonts-noto-color-emoji \
     xvfb \
+    wget \
+    ldd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -34,6 +37,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Install bundled Chromium for Patchright
 RUN patchright install chromium
+
+# Verify Chromium was installed correctly
+RUN python -c "\
+import glob, os; \
+bins = glob.glob(os.path.expanduser('~/.cache/ms-playwright/chromium-*/chrome-linux/chrome')) + \
+       glob.glob(os.path.expanduser('~/.cache/ms-patchright/chromium-*/chrome-linux/chrome')); \
+print(f'Chromium binaries found: {bins}'); \
+assert bins, 'ERROR: No Chromium binary found after patchright install chromium'; \
+os.chmod(bins[0], 0o755); \
+print(f'Chromium binary: {bins[0]}'); \
+print(f'Chromium executable: {os.access(bins[0], os.X_OK)}')"
 
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
@@ -48,5 +62,8 @@ ENV PORT=5000
 # DISPLAY=:99 tells Xvfb where to create the virtual display.
 ENV HEADLESS_MODE=1
 ENV DISPLAY=:99
+
+# Ensure Python output is unbuffered so logs appear immediately
+ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["./entrypoint.sh"]

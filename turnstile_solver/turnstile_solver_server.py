@@ -67,6 +67,7 @@ class TurnstileSolverServer:
     self.app.post(CAPTCHA_EVENT_CALLBACK_ENDPOINT)(self._handle_captcha_message_event)
     self.app.get('/solve')(self._solve)
     self.app.get('/')(self._index)
+    self.app.get('/health')(self._health)
 
   def subscribe_captcha_message_event_handler(self, id: str, handler: MessageEventHandler):
     logger.debug(f"Captcha message event handler with id '{id}' subscribed")
@@ -172,13 +173,30 @@ class TurnstileSolverServer:
     if isawaitable(a := handler(evt, data)):
       await a
 
+  async def _health(self):
+    """Health-check endpoint. Returns pool status for diagnostics."""
+    pool_status = "not_initialized"
+    if self.browser_context_pool is not None:
+      try:
+        pool_status = f"ready (contexts={len(self.browser_context_pool.in_use) + len(self.browser_context_pool.available)})"
+      except Exception:
+        pool_status = "initializing"
+    return self._ok({
+      "status": "ok" if self.browser_context_pool is not None else "initializing",
+      "pool": pool_status,
+      "solver": "assigned" if self.solver else "missing",
+    })
+
   async def _solve(self):
     try:
       if self.solver is None:
         return self._error("No TurnstileSolver instance has been assigned")
 
       if not self.browser_context_pool:
-        return self._error("No BrowserContextPool instance has been assigned")
+        return self._error("Browser pool not yet initialized (server still starting up)", status_code=503, status="initializing")
+
+      if not self.browser_context_pool._browser:
+        return self._error("Browser not yet launched (server still starting up)", status_code=503, status="initializing")
 
       data: dict[str, str] = await request.get_json(force=True)
       if not (site_url := data.get('site_url')):
