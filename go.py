@@ -491,7 +491,11 @@ async def _init_browser_pool(proxy_file: str):
 
 
 async def solve_captcha_via_solver() -> str | None:
-    """Solve a Turnstile captcha using the in-process solver."""
+    """Solve a Turnstile captcha using the in-process solver.
+
+    Calls the solver directly (not via HTTP) to avoid body parsing issues
+    with GET requests and reduce overhead.
+    """
     global solver_ready, solver_server, solver_error
 
     if not solver_server:
@@ -504,35 +508,41 @@ async def solve_captcha_via_solver() -> str | None:
             print("=> [solver] Browser pool not initialized, skipping captcha solve")
             return None
 
-    # Call the solver's /solve endpoint via HTTP (it's running on 127.0.0.1:8088)
+    # Call the solver directly in-process
     print("=> Solving captcha...")
     try:
-        resp = requests.get(
-            "http://127.0.0.1:8088/solve",
-            json={"site_url": SITE_URL, "site_key": SITE_KEY},
-            headers={"secret": "jWRN7DH6"},
-            timeout=120,
-        )
-        if resp.status_code == 503:
-            print(f"=> [solver] Still initializing: {resp.json().get('message', '')}")
-            return None
-        if resp.status_code != 200:
-            print(f"=> Captcha failed [{resp.status_code}]: {resp.text[:200]}")
-            return None
-        data = resp.json()
-        token = data.get("token")
-        elapsed = data.get("elapsed", "?")
-        if token:
+        # Get a page from the pool
+        async with solver_server._lock:
+            page_pool = await solver_server.browser_context_pool.get()
+            page = await page_pool.get()
+
+        try:
+            # Solve the captcha
+            result = await solver_server.solver.solve(
+                site_url=SITE_URL,
+                site_key=SITE_KEY,
+                page=page,
+                about_blank_on_finish=True,
+            )
+
+            if not result:
+                print(f"=> Captcha failed: {solver_server.solver.error}")
+                return None
+
+            token = result.token
+            elapsed = str(result.elapsed.total_seconds())
             print(f"=> Captcha solved in {elapsed}s: {token[:30]}...")
             return token
-        print(f"=> Captcha failed: {data.get('message', 'no token')}")
-    except requests.Timeout:
-        print("=> Captcha timed out (120s)")
-    except requests.ConnectionError:
-        print("=> Captcha error: solver server not reachable")
+
+        finally:
+            # Put the page back in the pool
+            await solver_server.browser_context_pool.put_back(page_pool)
+            await page_pool.put_back(page)
+
     except Exception as exc:
         print(f"=> Captcha error: {exc}")
-    return None
+        traceback.print_exc()
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
