@@ -44,6 +44,10 @@ class ProxyProvider:
           continue
         parts = line.split('@')
         server = parts[0]
+        # Ensure the server URL has a scheme — Playwright requires
+        # "http://host:port" but the proxy file may contain bare "host:port".
+        if server and not server.startswith(('http://', 'https://', 'socks')):
+          server = f"http://{server}"
         if len(parts) > 1:
           username, password = parts[1].split(':')
         else:

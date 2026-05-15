@@ -1,31 +1,31 @@
+"""
+Wala-jey — GoLogin Account Creator with Cloudflare Turnstile CAPTCHA Solver
+
+Architecture:
+  - Single process: HTTP API (for Railway) + in-process Turnstile solver
+  - proxy.txt provides browser proxies for the CAPTCHA solver
+  - Harvested GoLogin proxies are written to proxies.txt and served at /proxies
+  - No subprocess isolation — the solver runs in the main asyncio event loop
+"""
+
 import asyncio
-import multiprocessing
+import logging
 import os
 import random
-import sys
 import signal
+import sys
 import threading
 import time
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
 import requests
 import urllib3
 
-# Use 'spawn' start method to avoid fork-related EPIPE crashes
-# with Playwright's Node.js driver subprocess.
-try:
-    multiprocessing.set_start_method("spawn")
-except RuntimeError:
-    pass  # already set
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ── Configuration ───────────────────────────────────────────────────────────
-SOLVER_HOST = "127.0.0.1"
-SOLVER_PORT = 8088
-SOLVER_SECRET = "jWRN7DH6"
-
+# ── Configuration ──────────────────────────────────────────────────────────────
 GOLOGIN_API = "https://api.gologin.com"
 SITE_URL = "https://captcha.gologin.com"
 SITE_KEY = "0x4AAAAAAAQn-wN8S1gi-nJa"
@@ -46,24 +46,37 @@ UA = (
 
 PROXY_FILE = "proxy.txt"
 PROXIES_OUTPUT = "proxies.txt"
-API_PORT = int(os.environ.get("PORT", 5000))  # Replit sets PORT env var
-DELAY_BETWEEN_ACCOUNTS = 5  # seconds between account creation cycles
-MAX_CONSECUTIVE_FAILURES = 10  # restart solver after this many failures in a row
 SOLVER_PROXY_FILE = "_solver_proxies.txt"
+ACCOUNTS_FILE = "accounts.txt"
+API_PORT = int(os.environ.get("PORT", 5000))
+DELAY_BETWEEN_ACCOUNTS = 5
+MAX_CONSECUTIVE_FAILURES = 10
 
-# Auto-detect headless mode:
-# - HEADLESS_MODE env var takes precedence (set to "1" or "0" explicitly).
-#   The Dockerfile sets HEADLESS_MODE=1.
-# - Otherwise, auto-detect: no real display means headless.
 HEADLESS = os.environ.get("HEADLESS_MODE", "").lower() in ("1", "true", "yes")
 if not HEADLESS and not os.environ.get("HEADLESS_MODE"):
-    # Fallback auto-detect: if no DISPLAY at all, or only virtual :99
     display = os.environ.get("DISPLAY", "")
     if not display:
         HEADLESS = True
 
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("wala-jey")
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Solver state (shared between main and solver) ──────────────────────────────
+solver_ready = False
+solver_server = None
+solver_error = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Proxy helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
 def gen_str(n: int = 8) -> str:
     return "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=n))
 
@@ -99,146 +112,217 @@ def pick_request_proxy(harvested: list[str]) -> dict | None:
         return None
 
 
-def load_proxies() -> list[str]:
-    """Load proxies from *proxy.txt*.
-
-    If the file contains a single raw API URL (starts with ``http://`` or
-    ``https://``), proxies are fetched from that endpoint at runtime.
-    Otherwise every non-empty line is treated as a proxy string.
+def load_proxies_from_file(filepath: str) -> list[str]:
+    """Load proxies from a file.  Supports:
+    - proxy.txt format:  user:pass:host:port  → converted to host:port@user:pass
+    - solver format:     host:port@user:pass  → kept as-is
+    - API URL:           http://…             → fetched from endpoint
     """
     try:
-        if not os.path.exists(PROXY_FILE):
+        if not os.path.exists(filepath):
             return []
 
-        with open(PROXY_FILE, "r") as fh:
+        with open(filepath, "r") as fh:
             content = fh.read().strip()
 
         if not content:
             return []
 
         first_line = content.splitlines()[0].strip()
+
+        # If the first line is an API URL, fetch proxies from it
         if first_line.startswith("http://") or first_line.startswith("https://"):
-            api_url = first_line
-            print(f"=> Fetching proxies from API: {api_url}")
+            print(f"=> Fetching proxies from API: {first_line}")
             try:
-                resp = requests.get(api_url, timeout=30, verify=False)
+                resp = requests.get(first_line, timeout=30, verify=False)
                 if resp.status_code != 200:
                     print(f"=> Proxy API returned HTTP {resp.status_code}")
                     return []
                 try:
                     data = resp.json()
                     if isinstance(data, list):
-                        proxies = [str(p) for p in data if p]
+                        raw = [str(p) for p in data if p]
                     elif isinstance(data, dict) and "proxies" in data:
-                        proxies = [str(p) for p in data["proxies"] if p]
+                        raw = [str(p) for p in data["proxies"] if p]
                     else:
-                        proxies = resp.text.strip().splitlines()
+                        raw = resp.text.strip().splitlines()
                 except ValueError:
-                    proxies = resp.text.strip().splitlines()
-                print(f"=> Fetched {len(proxies)} proxies from API")
-                return [p.strip() for p in proxies if p.strip()]
+                    raw = resp.text.strip().splitlines()
+                print(f"=> Fetched {len(raw)} proxies from API")
+                return _convert_proxy_lines(raw)
             except Exception as exc:
                 print(f"=> Error fetching proxies from API: {exc}")
                 return []
 
-        return [line.strip() for line in content.splitlines() if line.strip()]
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        return _convert_proxy_lines(lines)
     except Exception as exc:
-        print(f"=> Error loading proxies: {exc}")
+        print(f"=> Error loading proxies from {filepath}: {exc}")
         return []
 
 
-def build_proxy_file() -> str:
-    """Create an empty solver proxy file.
+def _convert_proxy_lines(lines: list[str]) -> list[str]:
+    """Convert proxy lines to the solver's expected format: host:port@user:pass
 
-    The file starts empty -- only harvested GoLogin proxies are written to
-    it (via sync_harvested_to_solver).  The ProxyProvider auto-reloads
-    when it detects changes.
+    Input formats accepted:
+      - user:pass:host:port  (GoLogin format from proxy.txt)
+      - host:port@user:pass  (solver format — kept as-is)
+      - host:port            (no auth)
     """
+    converted = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if "@" in line:
+            # Already in solver format: host:port@user:pass
+            converted.append(line)
+        else:
+            parts = line.split(":")
+            if len(parts) == 4:
+                # user:pass:host:port → host:port@user:pass
+                user, pwd, host, port = parts
+                converted.append(f"{host}:{port}@{user}:{pwd}")
+            elif len(parts) == 2:
+                # host:port (no auth)
+                converted.append(line)
+            else:
+                # Unknown format — pass through
+                converted.append(line)
+    return converted
+
+
+def build_solver_proxy_file() -> str:
+    """Create the solver proxy file from proxy.txt, converting formats."""
+    proxies = load_proxies_from_file(PROXY_FILE)
     with open(SOLVER_PROXY_FILE, "w") as fh:
-        fh.write("")
+        for p in proxies:
+            fh.write(p + "\n")
+    print(f"=> Wrote {len(proxies)} proxies to {SOLVER_PROXY_FILE}")
     return SOLVER_PROXY_FILE
 
 
 def sync_harvested_to_solver():
-    """Append harvested proxies (from proxies.txt) to the solver proxy file.
+    """Append harvested GoLogin proxies to the solver proxy file.
 
-    Converts ``user:pass:host:port`` → ``host:port@user:pass`` format that
-    the solver's ProxyProvider expects.  The provider auto-reloads on change.
+    Converts user:pass:host:port → host:port@user:pass format.
     """
     try:
-        if not os.path.exists(PROXIES_OUTPUT):
-            return
-        with open(PROXIES_OUTPUT, "r") as fh:
-            lines = [l.strip() for l in fh if l.strip()]
-        if not lines:
+        harvested = load_harvested_proxies()
+        if not harvested:
             return
 
+        # Load existing solver proxies
+        existing = set()
+        if os.path.exists(SOLVER_PROXY_FILE):
+            with open(SOLVER_PROXY_FILE, "r") as fh:
+                existing = {l.strip() for l in fh if l.strip()}
+
         converted = []
-        for line in lines:
+        for line in harvested:
             parts = line.split(":")
             if len(parts) == 4:
                 user, pwd, host, port = parts
-                converted.append(f"{host}:{port}@{user}:{pwd}")
+                proxy_str = f"{host}:{port}@{user}:{pwd}"
             else:
-                converted.append(line)
+                proxy_str = line
+            if proxy_str not in existing:
+                converted.append(proxy_str)
+                existing.add(proxy_str)
 
-        with open(SOLVER_PROXY_FILE, "w") as fh:
-            fh.write("\n".join(converted) + "\n")
-        print(f"=> Synced {len(converted)} harvested proxies to solver")
+        if not converted:
+            return
+
+        # Append new proxies
+        with open(SOLVER_PROXY_FILE, "a") as fh:
+            for p in converted:
+                fh.write(p + "\n")
+        print(f"=> Synced {len(converted)} new harvested proxies to solver")
     except Exception as exc:
         print(f"=> Error syncing proxies to solver: {exc}")
 
 
-# ── Raw Proxy API Server ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  HTTP API Server
+# ══════════════════════════════════════════════════════════════════════════════
+
 class _ProxyAPIHandler(BaseHTTPRequestHandler):
-    """Serves harvested proxies as raw text at /proxies."""
+    """Serves harvested proxies and accounts as raw text."""
 
     def do_GET(self):
         try:
-            if self.path == "/proxies" or self.path == "/proxies/":
+            if self.path in ("/proxies", "/proxies/"):
                 content = ""
                 if os.path.exists(PROXIES_OUTPUT):
                     with open(PROXIES_OUTPUT, "r") as fh:
                         content = fh.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(content.encode())
-            elif self.path == "/accounts" or self.path == "/accounts/":
+                self._text(200, content)
+
+            elif self.path in ("/accounts", "/accounts/"):
                 content = ""
-                if os.path.exists("accounts.txt"):
-                    with open("accounts.txt", "r") as fh:
+                if os.path.exists(ACCOUNTS_FILE):
+                    with open(ACCOUNTS_FILE, "r") as fh:
                         content = fh.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(content.encode())
-            elif self.path == "/status" or self.path == "/status/":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"running")
+                self._text(200, content)
+
+            elif self.path in ("/status", "/status/"):
+                status = "initializing"
+                if solver_ready:
+                    status = "running"
+                elif solver_error:
+                    status = f"error: {solver_error}"
+                self._text(200, status)
+
+            elif self.path in ("/health", "/health/"):
+                self._json(200, {
+                    "status": "ok" if solver_ready else "initializing",
+                    "solver": "ready" if solver_ready else "starting",
+                    "accounts": _count_lines(ACCOUNTS_FILE),
+                    "proxies": _count_lines(PROXIES_OUTPUT),
+                })
+
             else:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(
-                    b"Wala-jey Proxy API\n"
-                    b"  GET /proxies  - harvested proxies (raw text)\n"
-                    b"  GET /accounts - created accounts (raw text)\n"
-                    b"  GET /status   - server status\n"
+                self._text(200,
+                    "Wala-jey — GoLogin Account Creator\n"
+                    "  GET /proxies   - harvested proxies (user:pass:host:port)\n"
+                    "  GET /accounts  - created accounts (email:pass)\n"
+                    "  GET /status    - solver status\n"
+                    "  GET /health    - JSON health check\n"
                 )
         except Exception:
             try:
-                self.send_response(500)
-                self.end_headers()
+                self._text(500, "Internal error")
             except Exception:
                 pass
 
+    def _text(self, code: int, body: str):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def _json(self, code: int, data: dict):
+        import json
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
     def log_message(self, format, *args):
         pass  # suppress noisy request logs
+
+
+def _count_lines(filepath: str) -> int:
+    try:
+        if not os.path.exists(filepath):
+            return 0
+        with open(filepath, "r") as fh:
+            return sum(1 for l in fh if l.strip())
+    except Exception:
+        return 0
 
 
 def _start_proxy_api():
@@ -246,7 +330,7 @@ def _start_proxy_api():
     while True:
         try:
             server = HTTPServer(("0.0.0.0", API_PORT), _ProxyAPIHandler)
-            print(f"=> Proxy API server running on http://0.0.0.0:{API_PORT}/proxies")
+            print(f"=> Proxy API server running on http://0.0.0.0:{API_PORT}")
             server.serve_forever()
         except OSError as exc:
             if "Address already in use" in str(exc):
@@ -260,211 +344,165 @@ def _start_proxy_api():
             time.sleep(5)
 
 
-# ── Solver Server ───────────────────────────────────────────────────────────
-def _start_solver_server(proxies_file: str) -> None:
-    """Entry-point for the solver subprocess."""
+# ══════════════════════════════════════════════════════════════════════════════
+#  In-process Turnstile Solver
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def init_solver(proxy_file: str):
+    """Initialize the Turnstile solver server in-process.
+
+    Uses run_task() so the Quart server runs as a non-blocking asyncio task.
+    The browser pool init happens in the background after the server is up.
+    """
+    global solver_ready, solver_server, solver_error
+
     try:
-        # ── Verify patchright + chromium are available ──
-        import patchright
-        print(f"=> [solver] patchright version: {getattr(patchright, '__version__', 'unknown')}")
-
-        # Find and log the chromium executable path
-        try:
-            from patchright._impl._driver import compute_driver_executable
-            driver_path = compute_driver_executable()
-            print(f"=> [solver] patchright driver: {driver_path}")
-        except Exception as e:
-            print(f"=> [solver] Could not determine patchright driver path: {e}")
-
-        # Check if chromium binary exists
-        import subprocess as sp
-        try:
-            result = sp.run(
-                ["python", "-m", "patchright", "install", "--dry-run", "chromium"],
-                capture_output=True, text=True, timeout=10
-            )
-            print(f"=> [solver] patchright chromium check: rc={result.returncode}")
-            if result.stdout:
-                print(f"=> [solver]   stdout: {result.stdout[:500]}")
-            if result.stderr:
-                print(f"=> [solver]   stderr: {result.stderr[:500]}")
-        except Exception as e:
-            print(f"=> [solver] patchright chromium check failed: {e}")
-
-        # Try to find the actual chromium binary
-        try:
-            from patchright._impl._browser_type import BrowserType
-            # The chromium binary is usually at ~/.cache/ms-playwright/chromium-*/chrome-linux/chrome
-            import glob
-            chromium_bins = glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"))
-            if chromium_bins:
-                print(f"=> [solver] Found chromium binary: {chromium_bins[0]}")
-                os.chmod(chromium_bins[0], 0o755)  # ensure it's executable
-            else:
-                print("=> [solver] WARNING: No chromium binary found in ~/.cache/ms-playwright/")
-                # Try patchright's own cache dir
-                chromium_bins = glob.glob(os.path.expanduser("~/.cache/ms-patchright/chromium-*/chrome-linux/chrome"))
-                if chromium_bins:
-                    print(f"=> [solver] Found patchright chromium binary: {chromium_bins[0]}")
-                    os.chmod(chromium_bins[0], 0o755)
-                else:
-                    print("=> [solver] WARNING: No chromium binary found in ~/.cache/ms-patchright/ either")
-        except Exception as e:
-            print(f"=> [solver] Error locating chromium binary: {e}")
-
-        # Check for missing shared libraries
-        try:
-            chrome_path = None
-            for search in [
-                os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
-                os.path.expanduser("~/.cache/ms-patchright/chromium-*/chrome-linux/chrome"),
-            ]:
-                import glob as _glob
-                matches = _glob.glob(search)
-                if matches:
-                    chrome_path = matches[0]
-                    break
-            if chrome_path:
-                ldd_result = sp.run(["ldd", chrome_path], capture_output=True, text=True, timeout=10)
-                missing = [line for line in ldd_result.stdout.splitlines() if "not found" in line]
-                if missing:
-                    print(f"=> [solver] WARNING: Missing shared libraries:")
-                    for lib in missing:
-                        print(f"=> [solver]   {lib.strip()}")
-                else:
-                    print("=> [solver] All shared libraries present for chromium")
-        except Exception as e:
-            print(f"=> [solver] Could not check shared libraries: {e}")
-
-        sys.stdout.flush()
-
-        from turnstile_solver.main import run_server
         from turnstile_solver.proxy_provider import ProxyProvider
+        from turnstile_solver.turnstile_solver_server import TurnstileSolverServer
+        from turnstile_solver.solver import TurnstileSolver
+        import turnstile_solver.constants as c
 
-        proxy_provider = ProxyProvider(proxies_file)
+        # ── Load proxies for the solver ──
+        proxy_provider = ProxyProvider(proxy_file)
         proxy_provider.load()
+        print(f"=> Solver proxy provider: {len(proxy_provider.proxies)} proxies loaded")
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        # Critical headless args for Railway/Docker:
-        # - --disable-gpu: avoid GPU crashes in containers
-        # - --window-size: ensure widget renders correctly
-        # - --hide-scrollbars: cleaner rendering
+        # ── Build solver + server manually ──
         extra_args = [
             "--disable-gpu",
             "--window-size=1920,1080",
             "--hide-scrollbars",
         ] if HEADLESS else []
 
-        print(f"=> [solver] Starting run_server(headless={HEADLESS}, browser=chromium)...")
-        sys.stdout.flush()
-
-        loop.run_until_complete(
-            run_server(
-                host=SOLVER_HOST,
-                port=SOLVER_PORT,
-                secret=SOLVER_SECRET,
-                headless=HEADLESS,
-                browser="chromium",
-                browser_position=(2000, 2000),
-                proxy_provider=proxy_provider,
-                max_attempts=5,
-                attempt_timeout=30,
-                page_load_timeout=30,
-                browser_args=extra_args,
-            )
+        solver_server = TurnstileSolverServer(
+            host="127.0.0.1",
+            port=8088,
+            secret="jWRN7DH6",
+            disable_access_logs=True,
+            turnstile_solver=None,
+            on_shutting_down=None,
+            console=None,
+            log_level=logging.INFO,
+            ignore_food_events=True,
         )
+
+        solver = TurnstileSolver(
+            server=solver_server,
+            page_load_timeout=30,
+            browser_position=(2000, 2000),
+            browser_executable_path=None,
+            browser="chromium",
+            reload_page_on_captcha_overrun_event=False,
+            max_attempts=5,
+            attempt_timeout=30,
+            headless=HEADLESS,
+            console=None,
+            log_level=logging.INFO,
+            proxy=None,
+            browser_args=extra_args,
+        )
+        solver_server.solver = solver
+
+        # ── Mark the server as "not down" so pool init can proceed ──
+        # When using run_task() directly (bypassing solver_server.run()),
+        # the before_serving hook that sets down=False never fires.
+        # We set it manually here.
+        solver_server.down = False
+
+        # ── Start HTTP server as a non-blocking task ──
+        # run_task() starts the Quart server without awaiting it —
+        # it returns immediately and the server runs in the background.
+        await solver_server.app.run_task(
+            host=solver_server.host,
+            port=solver_server.port,
+            debug=False,
+        )
+        # This point is reached when the server finishes — mark it
+        solver_server.down = True
+        solver_error = "Solver server exited unexpectedly"
+        print("=> [solver] Server exited unexpectedly!")
+
     except Exception as exc:
-        print(f"=> Solver server error: {exc}")
+        solver_error = str(exc)
+        print(f"=> [solver] Fatal error: {exc}")
         traceback.print_exc()
-        sys.stdout.flush()
-        sys.exit(1)
 
 
-def start_solver_process(proxy_file: str) -> multiprocessing.Process:
-    """Start the solver in a subprocess and return the Process object."""
-    proc = multiprocessing.Process(
-        target=_start_solver_server,
-        args=(proxy_file,),
-        daemon=True,
-    )
-    proc.start()
-    print(f"=> Solver subprocess started (PID: {proc.pid})")
-    return proc
+async def _init_browser_pool(proxy_file: str):
+    """Initialize the browser context pool (with retries).
 
+    This is called after the solver HTTP server is up. If the pool init
+    fails (e.g. Chromium crash, proxy issues), it retries every 30 seconds.
+    """
+    global solver_ready, solver_server, solver_error
 
-def wait_for_solver(timeout: int = 120) -> bool:
-    """Wait until the solver server is reachable and browser pool is ready."""
-    print("=> Waiting for solver server...")
-    deadline = time.time() + timeout
-    server_up = False
-    while time.time() < deadline:
-        # First check if the subprocess is even alive
-        # (we don't have the proc here, but the HTTP check covers it)
-        try:
-            # Check basic liveness first
-            resp = requests.get(
-                f"http://{SOLVER_HOST}:{SOLVER_PORT}/",
-                headers={"secret": SOLVER_SECRET},
-                timeout=3,
-            )
-            if resp.status_code == 200 and not server_up:
-                server_up = True
-                print("=> Solver HTTP server is up, waiting for browser pool...")
-            
-            # Check if browser pool is ready
-            if server_up:
-                try:
-                    health = requests.get(
-                        f"http://{SOLVER_HOST}:{SOLVER_PORT}/health",
-                        headers={"secret": SOLVER_SECRET},
-                        timeout=3,
-                    )
-                    if health.status_code == 200:
-                        data = health.json()
-                        pool_status = data.get("pool", "unknown")
-                        if "ready" in str(pool_status):
-                            print(f"=> Solver server ready (pool: {pool_status})")
-                            return True
-                        elif "not_initialized" in str(pool_status):
-                            # Server is up but pool hasn't started init yet — wait
-                            pass
-                        else:
-                            print(f"=> Solver pool status: {pool_status}")
-                except Exception:
-                    pass  # health endpoint might not be available yet
-        except (requests.ConnectionError, requests.Timeout):
-            pass
-        except Exception:
-            pass
-        time.sleep(2)
-    
-    if server_up:
-        print("=> Solver HTTP server is up but browser pool did not initialize in time")
-        print("=> The solver will work once the browser pool finishes initializing")
-        return True  # Server is reachable, pool might finish init later
+    from turnstile_solver.proxy_provider import ProxyProvider
+    import turnstile_solver.constants as c
+
+    # Wait for solver server to be up
+    for i in range(120):
+        if solver_server and not solver_server.down:
+            break
+        await asyncio.sleep(1)
     else:
-        print("=> Solver server failed to start within timeout")
-        return False
+        print("=> [pool] Solver server never came up — cannot init pool")
+        solver_error = "Solver server never came up"
+        return
+
+    print("=> [pool] Solver server is up, initializing browser context pool...")
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            proxy_provider = ProxyProvider(proxy_file)
+            proxy_provider.load()
+            print(f"=> [pool] Attempt {attempt}: {len(proxy_provider.proxies)} proxies available")
+
+            await solver_server.create_browser_context_pool(
+                max_contexts=min(c.MAX_CONTEXTS, 3),  # limit for Railway
+                max_pages_per_context=1,
+                single_instance=True,
+                proxy_provider=proxy_provider,
+            )
+            solver_ready = True
+            solver_error = None
+            print(f"=> [pool] Browser context pool ready — solver is online! (attempt {attempt})")
+            return
+        except Exception as exc:
+            solver_error = str(exc)
+            print(f"=> [pool] Attempt {attempt} failed: {exc}")
+            wait = min(30 * attempt, 120)
+            print(f"=> [pool] Retrying in {wait}s...")
+            await asyncio.sleep(wait)
 
 
-def is_solver_alive(proc: multiprocessing.Process) -> bool:
-    """Check if the solver subprocess is still running."""
-    return proc is not None and proc.is_alive()
+async def solve_captcha_via_solver() -> str | None:
+    """Solve a Turnstile captcha using the in-process solver."""
+    global solver_ready, solver_server, solver_error
 
+    if not solver_server:
+        print("=> [solver] Server not started yet")
+        return None
 
-# ── Captcha ─────────────────────────────────────────────────────────────────
-def solve_captcha() -> str | None:
-    """Request the solver to solve a Turnstile captcha."""
+    if not solver_ready:
+        # Pool not ready — check if we can still try
+        if solver_server.browser_context_pool is None:
+            print("=> [solver] Browser pool not initialized, skipping captcha solve")
+            return None
+
+    # Call the solver's /solve endpoint via HTTP (it's running on 127.0.0.1:8088)
     print("=> Solving captcha...")
     try:
         resp = requests.get(
-            f"http://{SOLVER_HOST}:{SOLVER_PORT}/solve",
+            "http://127.0.0.1:8088/solve",
             json={"site_url": SITE_URL, "site_key": SITE_KEY},
-            headers={"secret": SOLVER_SECRET},
+            headers={"secret": "jWRN7DH6"},
             timeout=120,
         )
+        if resp.status_code == 503:
+            print(f"=> [solver] Still initializing: {resp.json().get('message', '')}")
+            return None
         if resp.status_code != 200:
             print(f"=> Captcha failed [{resp.status_code}]: {resp.text[:200]}")
             return None
@@ -484,9 +522,12 @@ def solve_captcha() -> str | None:
     return None
 
 
-# ── GoLogin API ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  GoLogin API
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_proxies_from_gologin(bearer: str, req_proxy: dict | None = None) -> bool:
-    """Fetch proxy list from GoLogin and append to *proxies.txt*."""
+    """Fetch proxy list from GoLogin and write to proxies.txt."""
     print("=> Fetching proxies from GoLogin...")
     headers = {
         "accept": "*/*",
@@ -507,14 +548,16 @@ def get_proxies_from_gologin(bearer: str, req_proxy: dict | None = None) -> bool
             return False
         prox_list = resp.json().get("proxies", [])
         if not prox_list:
-            print("=> No proxies returned")
+            print("=> No proxies returned from GoLogin")
             return False
+        new_count = 0
         with open(PROXIES_OUTPUT, "a") as fh:
             for p in prox_list:
                 if all(p.get(k) for k in ("username", "password", "host", "port")):
                     fh.write(f"{p['username']}:{p['password']}:{p['host']}:{p['port']}\n")
-        print(f"=> Saved {len(prox_list)} proxies to {PROXIES_OUTPUT}")
-        return True
+                    new_count += 1
+        print(f"=> Saved {new_count} proxies to {PROXIES_OUTPUT}")
+        return new_count > 0
     except Exception as exc:
         print(f"=> Proxy fetch error: {exc}")
         return False
@@ -563,9 +606,9 @@ def create_account(captcha_token: str, req_proxy: dict | None = None) -> bool:
         if resp.status_code in (200, 201):
             print(f"=> Account created: {email}")
             bearer = resp.json().get("token")
-            with open("accounts.txt", "a") as fh:
+            with open(ACCOUNTS_FILE, "a") as fh:
                 fh.write(f"{email}:{pwd}\n")
-            print("=> Saved to accounts.txt")
+            print(f"=> Saved to {ACCOUNTS_FILE}")
             time.sleep(0.5)
             if bearer:
                 get_proxies_from_gologin(bearer, req_proxy=req_proxy)
@@ -583,77 +626,103 @@ def create_account(captcha_token: str, req_proxy: dict | None = None) -> bool:
         return False
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
-def main() -> None:
-    print("=" * 50)
-    print("  Wala-jey — GoLogin Account Creator")
-    print("=" * 50)
+# ══════════════════════════════════════════════════════════════════════════════
+#  Main Application
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Start the raw proxy API server (runs in background thread)
+async def app_main():
+    """Main application loop — runs solver + account creation in-process."""
+    global solver_ready
+
+    print("=" * 60)
+    print("  Wala-jey — GoLogin Account Creator + Proxy Harvester")
+    print("=" * 60)
+    print(f"  Headless: {HEADLESS}")
+    print(f"  API Port: {API_PORT}")
+    print(f"  Proxy file: {PROXY_FILE}")
+    print("=" * 60)
+
+    # ── Build solver proxy file from proxy.txt ──
+    proxy_file = build_solver_proxy_file()
+
+    # ── Start HTTP API server in background thread ──
     api_thread = threading.Thread(target=_start_proxy_api, daemon=True)
     api_thread.start()
+    # Give it a moment to bind the port
+    await asyncio.sleep(0.5)
 
-    # Load initial proxies for API requests (supports raw API URL in proxy.txt)
-    proxies = load_proxies()
-    if proxies:
-        print(f"=> Loaded {len(proxies)} proxies from {PROXY_FILE} (for API requests)")
+    # ── Start the Turnstile solver in-process ──
+    # Use run_task() so the Quart server runs as a non-blocking asyncio task.
+    # This returns immediately — the server runs in the background.
+    solver_task = asyncio.create_task(init_solver(proxy_file))
+
+    # ── Initialize browser pool in a separate background task ──
+    # This retries automatically if the first attempt fails.
+    pool_task = asyncio.create_task(_init_browser_pool(proxy_file))
+
+    # Wait for the solver to be ready (with progress logging)
+    print("=> Waiting for solver to initialize...")
+    wait_start = time.time()
+    while not solver_ready:
+        elapsed = int(time.time() - wait_start)
+        if elapsed > 0 and elapsed % 15 == 0:
+            print(f"=> Still waiting for solver... ({elapsed}s) pool_error={solver_error}")
+
+        # Check if pool task finished (success or fatal failure)
+        if pool_task.done():
+            try:
+                pool_task.result()
+            except Exception as exc:
+                print(f"=> Pool init task failed: {exc}")
+                break
+
+        # Check if solver task died
+        if solver_task.done():
+            try:
+                solver_task.result()
+            except Exception as exc:
+                print(f"=> Solver task died: {exc}")
+                break
+
+        if solver_error and elapsed > 60:
+            print(f"=> Solver has errors after 60s: {solver_error}")
+            print("=> Continuing to retry pool init in background...")
+            break
+
+        await asyncio.sleep(2)
+
+    if solver_ready:
+        print("=> Solver is ready! Starting account creation loop...")
     else:
-        print(f"=> No proxies loaded (add proxies to {PROXY_FILE} for best results)")
+        print("=> Solver not yet ready, but will keep trying in background...")
+        print("=> Starting account creation loop — will attempt captcha solves as the solver comes online")
 
-    # Solver browser proxy file starts empty; only harvested GoLogin proxies
-    # (residential) go here. Public proxies from proxy.txt are too unreliable
-    # for browser automation.
-    proxy_file = build_proxy_file()
-
-    # Start the turnstile solver server in a subprocess
-    solver_proc = start_solver_process(proxy_file)
-
-    if not wait_for_solver():
-        print("=> ERROR: Solver server failed to start")
-        print("=> Make sure patchright + chromium are installed:")
-        print("   pip install -r requirements.txt")
-        print("   patchright install chromium")
-        return
-
-    # Continuous account creation loop with auto-restart on crash
+    # ── Continuous account creation loop ──
     created = 0
     failed = 0
     consecutive_failures = 0
 
-    print("=" * 50)
-    print("=> Starting continuous account creation")
+    print("=" * 60)
+    print("=> Starting continuous account creation + proxy harvesting")
     print(f"=> Proxy API: http://0.0.0.0:{API_PORT}/proxies")
+    print(f"=> Health:    http://0.0.0.0:{API_PORT}/health")
     print("=> Press Ctrl+C to stop")
-    print("=" * 50)
+    print("=" * 60)
 
     try:
         while True:
             cycle = created + failed + 1
-            print(f"\n--- Cycle {cycle} (created: {created}, failed: {failed}) ---")
-
-            # Check if solver is still alive; restart if crashed
-            if not is_solver_alive(solver_proc):
-                print("=> Solver process died, restarting...")
-                try:
-                    solver_proc.terminate()
-                except Exception:
-                    pass
-                time.sleep(2)
-                solver_proc = start_solver_process(proxy_file)
-                if not wait_for_solver():
-                    print("=> Solver restart failed, waiting 30s...")
-                    time.sleep(30)
-                    continue
-
-            # Pick a random harvested proxy for API requests (if available)
             harvested = load_harvested_proxies()
+            print(f"\n--- Cycle {cycle} (created: {created}, failed: {failed}, proxies: {len(harvested)}) ---")
+
+            # Use harvested proxies for API requests (if available)
             req_proxy = pick_request_proxy(harvested)
             if req_proxy:
                 print(f"=> Using harvested proxy for API calls ({len(harvested)} available)")
 
             # Solve captcha
             try:
-                token = solve_captcha()
+                token = await solve_captcha_via_solver()
             except Exception as exc:
                 print(f"=> Unexpected captcha error: {exc}")
                 token = None
@@ -662,21 +731,12 @@ def main() -> None:
                 consecutive_failures += 1
                 failed += 1
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    print(f"=> {consecutive_failures} failures in a row, restarting solver...")
-                    try:
-                        solver_proc.terminate()
-                    except Exception:
-                        pass
-                    time.sleep(3)
-                    solver_proc = start_solver_process(proxy_file)
-                    if not wait_for_solver():
-                        print("=> Solver restart failed, waiting 30s...")
-                        time.sleep(30)
-                    consecutive_failures = 0
+                    print(f"=> {consecutive_failures} failures in a row, waiting longer...")
+                    delay = 60
                 else:
                     delay = min(DELAY_BETWEEN_ACCOUNTS * (1 + consecutive_failures), 60)
-                    print(f"=> Captcha failed ({consecutive_failures}x), retrying in {delay}s...")
-                    time.sleep(delay)
+                print(f"=> Captcha failed ({consecutive_failures}x), retrying in {delay}s...")
+                await asyncio.sleep(delay)
                 continue
 
             # Reset failure counter on successful captcha
@@ -695,27 +755,29 @@ def main() -> None:
                 print(f"=> Unexpected account creation error: {exc}")
                 failed += 1
 
-            # Brief delay between cycles to avoid rate limiting
+            # Brief delay between cycles
             print(f"=> Waiting {DELAY_BETWEEN_ACCOUNTS}s before next cycle...")
-            time.sleep(DELAY_BETWEEN_ACCOUNTS)
+            await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
 
-    except KeyboardInterrupt:
-        print(f"\n=> Shutting down. Created {created} accounts, {failed} failures.")
+    except asyncio.CancelledError:
+        print("\n=> Shutting down...")
     except Exception as exc:
         print(f"\n=> Fatal error in main loop: {exc}")
         traceback.print_exc()
     finally:
-        # Clean up solver process
-        try:
-            if solver_proc and solver_proc.is_alive():
-                solver_proc.terminate()
-                solver_proc.join(timeout=5)
-        except Exception:
-            pass
-        print("=> Goodbye!")
+        print(f"=> Done. Created {created} accounts, {failed} failures.")
+
+
+def main():
+    # Ignore broken pipe errors
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    try:
+        asyncio.run(app_main())
+    except KeyboardInterrupt:
+        print("\n=> Interrupted")
 
 
 if __name__ == "__main__":
-    # Ignore broken pipe errors (common on Replit when clients disconnect)
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL) if hasattr(signal, "SIGPIPE") else None
     main()
