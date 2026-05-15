@@ -403,22 +403,35 @@ async def init_solver(proxy_file: str):
         )
         solver_server.solver = solver
 
-        # ── Mark the server as "not down" so pool init can proceed ──
-        # When using run_task() directly (bypassing solver_server.run()),
-        # the before_serving hook that sets down=False never fires.
-        # We set it manually here.
-        solver_server.down = False
+        # ── Register before_serving / after_serving hooks ──
+        # These are normally registered inside solver_server.run(), but since
+        # we're calling solver_server.app.run_task() directly, we need to
+        # register them ourselves.
+        async def _before_serving():
+            solver_server.down = False
+            print("=> [solver] Server up and running (before_serving hook)")
+
+        async def _after_serving():
+            solver_server.down = True
+            print("=> [solver] Server is down (after_serving hook)")
+
+        solver_server.app.before_serving(_before_serving)
+        solver_server.app.after_serving(_after_serving)
 
         # ── Start HTTP server as a non-blocking task ──
-        # run_task() starts the Quart server without awaiting it —
-        # it returns immediately and the server runs in the background.
+        # app.run_task() starts the Quart/Hypercorn server. It handles the
+        # ASGI lifespan protocol, which fires Quart's before_serving hook
+        # (setting solver_server.down = False) and after_serving hook.
+        #
+        # Since we await this inside an asyncio.create_task(), the event loop
+        # can still run other tasks (pool init, account creation) while the
+        # server runs in the background.
         await solver_server.app.run_task(
             host=solver_server.host,
             port=solver_server.port,
             debug=False,
         )
         # This point is reached when the server finishes — mark it
-        solver_server.down = True
         solver_error = "Solver server exited unexpectedly"
         print("=> [solver] Server exited unexpectedly!")
 
