@@ -411,11 +411,12 @@ class TurnstileSolver:
     if not playwright:
       playwright = await async_playwright().start()
 
-    # Use headless="new" for the modern headless mode that shares the same
-    # rendering engine as headed Chromium.  The old headless=True mode uses a
-    # separate (limited) renderer that is trivially detected by Cloudflare
-    # Turnstile, causing every solve attempt to fail.
-    headless_mode = "new" if self.headless else False
+    # Use headless=True for the modern headless mode that shares the same
+    # rendering engine as headed Chromium.  In Patchright >=1.49,
+    # headless=True already uses the "new" headless mode (the old limited
+    # renderer was removed).  Passing headless="new" as a string is no
+    # longer accepted and causes "expected boolean, got string" errors.
+    headless_mode = True if self.headless else False
 
     # When using headless mode, avoid specifying a channel — patchright's
     # bundled Chromium is guaranteed to work.  Specifying a channel (e.g.
