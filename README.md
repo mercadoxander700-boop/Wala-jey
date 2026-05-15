@@ -8,12 +8,20 @@ GoLogin account creator with integrated Cloudflare Turnstile solver.
 - **Raw API proxy support** -- put a proxy API URL in `proxy.txt` and fresh proxies are fetched at runtime instead of keeping a static list.
 - **Auto proxy harvest** -- after creating a GoLogin account the script fetches proxies from the GoLogin API and saves them to `proxies.txt`.
 
-## Setup
+## Setup (local)
 
 ```bash
 pip install -r requirements.txt
 patchright install chromium
 ```
+
+## Deploy on Railway
+
+1. Push this repo to GitHub.
+2. Create a new project on [Railway](https://railway.app) and connect the repo.
+3. Railway auto-detects the `Dockerfile` — no extra config needed.
+4. Set the `PORT` environment variable in Railway if you want a custom port (defaults to `5000`).
+5. The app runs headless automatically (no display required).
 
 ## Proxy configuration (`proxy.txt`)
 
@@ -60,16 +68,22 @@ After running `go.py`, harvested proxies are served as raw text via HTTP:
 | `GET /proxies` | Harvested proxies from GoLogin (`user:pass:host:port`, one per line) |
 | `GET /accounts` | Created accounts (`email:password`, one per line) |
 
-**Example:** If running on Replit at `https://your-repl.repl.co`, use:
+**Railway:**
+```
+https://your-app.up.railway.app/proxies
+```
+
+**Replit:**
 ```
 https://your-repl.repl.co/proxies
 ```
-as a raw API proxy link in any other tool. The proxies update live as new accounts are created.
 
 **Local:**
 ```
 http://localhost:5000/proxies
 ```
+
+Use any of the above as a raw API proxy link in other tools. Proxies update live as new accounts are created.
 
 ## Output files
 

@@ -12,6 +12,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import urllib3
 
+# Use 'spawn' start method to avoid fork-related EPIPE crashes
+# with Playwright's Node.js driver subprocess.
+try:
+    multiprocessing.set_start_method("spawn")
+except RuntimeError:
+    pass  # already set
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Configuration ───────────────────────────────────────────────────────────
@@ -43,6 +50,9 @@ API_PORT = int(os.environ.get("PORT", 5000))  # Replit sets PORT env var
 DELAY_BETWEEN_ACCOUNTS = 5  # seconds between account creation cycles
 MAX_CONSECUTIVE_FAILURES = 10  # restart solver after this many failures in a row
 SOLVER_PROXY_FILE = "_solver_proxies.txt"
+
+# Auto-detect headless mode: Railway / Docker / CI have no display
+HEADLESS = not os.environ.get("DISPLAY")
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -136,9 +146,8 @@ def build_proxy_file() -> str:
     it (via sync_harvested_to_solver).  The ProxyProvider auto-reloads
     when it detects changes.
     """
-    if not os.path.exists(SOLVER_PROXY_FILE):
-        with open(SOLVER_PROXY_FILE, "w") as fh:
-            fh.write("")
+    with open(SOLVER_PROXY_FILE, "w") as fh:
+        fh.write("")
     return SOLVER_PROXY_FILE
 
 
@@ -255,17 +264,19 @@ def _start_solver_server(proxies_file: str) -> None:
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        extra_args = ["--disable-gpu"] if HEADLESS else []
         loop.run_until_complete(
             run_server(
                 host=SOLVER_HOST,
                 port=SOLVER_PORT,
                 secret=SOLVER_SECRET,
-                headless=False,
+                headless=HEADLESS,
                 browser="chromium",
                 browser_position=(2000, 2000),
                 proxy_provider=proxy_provider,
                 max_attempts=5,
                 attempt_timeout=30,
+                browser_args=extra_args,
             )
         )
     except Exception as exc:

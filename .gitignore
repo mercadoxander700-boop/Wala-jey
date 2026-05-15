@@ -1,4 +1,3 @@
-```
 # Temporary files
 *.tmp
 *.temp
@@ -74,6 +73,7 @@ Thumbs.db
 *.tar.xz
 *.tar.zst
 
-# Original rules preserved
-*.log
-```
+# Runtime data files (generated at runtime, not source code)
+accounts.txt
+proxies.txt
+_solver_proxies.txt
