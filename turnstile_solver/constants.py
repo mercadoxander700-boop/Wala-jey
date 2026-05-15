@@ -167,7 +167,7 @@ MAX_CONTEXTS = 40
 MAX_PAGES_PER_CONTEXT = 2
 PAGE_LOAD_TIMEOUT = 30
 BROWSER_POSITION = 2000, 2000
-BROWSER = "chrome"
+BROWSER = "chromium"
 BROWSERS = [
   "chrome",
   "chromium",

@@ -1,6 +1,9 @@
 FROM python:3.12-slim
 
-# Install Chromium dependencies + Xvfb for virtual display + fonts + debugging tools
+# Install Chromium dependencies + Xvfb for virtual display + fluxbox window manager
+# + fonts + debugging tools.
+# fluxbox is needed because some Chromium operations (and Turnstile's widget rendering)
+# expect a window manager to be running even on a virtual display.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libnspr4 \
@@ -25,6 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     fonts-liberation \
     xvfb \
+    fluxbox \
+    x11-utils \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -47,10 +52,10 @@ COPY . .
 # Railway sets PORT env var; default to 5000
 ENV PORT=5000
 
-# Tell the app it's running in Docker / headless environment.
-# HEADLESS_MODE=1 forces headless browser mode.
-# DISPLAY=:99 tells Xvfb where to create the virtual display.
-ENV HEADLESS_MODE=1
+# Xvfb virtual display — the browser runs in HEADED mode (headless=False)
+# because Cloudflare Turnstile detects and blocks headless browsers.
+# Xvfb provides a virtual display so headed mode works in Docker.
+# Do NOT set HEADLESS_MODE=1 — that would force headless=True which breaks Turnstile.
 ENV DISPLAY=:99
 
 # Ensure Python output is unbuffered so logs appear immediately

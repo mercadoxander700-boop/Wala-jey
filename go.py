@@ -52,11 +52,14 @@ API_PORT = int(os.environ.get("PORT", 5000))
 DELAY_BETWEEN_ACCOUNTS = 5
 MAX_CONSECUTIVE_FAILURES = 10
 
-HEADLESS = os.environ.get("HEADLESS_MODE", "").lower() in ("1", "true", "yes")
-if not HEADLESS and not os.environ.get("HEADLESS_MODE"):
-    display = os.environ.get("DISPLAY", "")
-    if not display:
-        HEADLESS = True
+# CRITICAL: Cloudflare Turnstile detects headless browsers and blocks the CAPTCHA.
+# When running in Docker/Railway, we use Xvfb to provide a virtual display so the
+# browser can run in headed mode (headless=False). This is the only reliable way
+# to solve Turnstile — headless=True always fails.
+# Set HEADLESS_MODE=1 ONLY if you have NO virtual display at all (rare / debugging).
+HEADLESS = False
+if os.environ.get("HEADLESS_MODE", "").lower() in ("1", "true", "yes"):
+    HEADLESS = True
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -368,13 +371,21 @@ async def init_solver(proxy_file: str):
         print(f"=> Solver proxy provider: {len(proxy_provider.proxies)} proxies loaded")
 
         # ── Build solver + server manually ──
-        # IMPORTANT: Do NOT add --disable-gpu or --disable-software-rasterizer here.
-        # These flags prevent the Turnstile widget from rendering correctly in
-        # headless mode. The solver's BROWSER_ARGS already has the correct flags.
+        # Browser args for Docker/Xvfb headed mode.
+        # These are CRITICAL for Turnstile to render correctly inside a container:
+        #   --use-gl=swiftshader    — software GL rendering (no real GPU in Docker)
+        #   --enable-webgl          — Turnstile needs WebGL to fingerprint the browser
+        #   --enable-unsafe-webgpu  — same, allows WebGPU which Turnstile checks
+        #   --start-maximized       — ensure full viewport for widget rendering
+        #   --enable-features=...   — SharedArrayBuffer + trust tokens Turnstile relies on
+        # Do NOT add --disable-gpu or --disable-software-rasterizer — they break WebGL!
         extra_args = [
-            "--window-size=1920,1080",
-            "--hide-scrollbars",
-        ] if HEADLESS else []
+            "--use-gl=swiftshader",
+            "--enable-webgl",
+            "--enable-unsafe-webgpu",
+            "--start-maximized",
+            "--enable-features=SharedArrayBuffer,TrustTokens,PrivateNetworkAccessChecksBypassingPermissionPolicy",
+        ]
 
         solver_server = TurnstileSolverServer(
             host="127.0.0.1",
@@ -397,7 +408,7 @@ async def init_solver(proxy_file: str):
             reload_page_on_captcha_overrun_event=False,
             max_attempts=5,
             attempt_timeout=30,
-            headless=HEADLESS,
+            headless=False,  # MUST be False — Turnstile blocks headless browsers. Xvfb provides virtual display.
             console=None,
             log_level=logging.INFO,
             proxy=None,

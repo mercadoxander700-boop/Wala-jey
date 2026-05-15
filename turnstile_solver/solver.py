@@ -51,33 +51,35 @@ BROWSER_ARGS = {
   '--disable-domain-reliability',
   '--disable-breakpad',
 
-  # Headless-mode essentials – these flags ensure the Turnstile widget
-  # renders correctly and the page content is fully laid out even when
-  # there is no physical display (Railway / Docker / CI).
-  '--disable-gpu',                       # avoid GPU-related crashes in containers
-  '--window-size=1920,1080',              # explicit viewport so widget paints fully
-  '--hide-scrollbars',                    # clean screenshots / rendering
+  # ── Docker / Xvfb rendering essentials ──
+  # These flags are CRITICAL for Turnstile to work inside containers.
+  # Turnstile uses WebGL/WebGPU fingerprinting — without these it detects
+  # a headless/non-rendering environment and blocks the CAPTCHA.
+  '--use-gl=swiftshader',             # software OpenGL — no real GPU in Docker
+  '--enable-webgl',                   # Turnstile checks for WebGL support
+  '--enable-unsafe-webgpu',           # some Turnstile challenges use WebGPU
+  '--start-maximized',                # full viewport for widget rendering
+  '--window-size=1920,1080',          # explicit viewport so widget paints fully
 
-  # Allow Manifest V2 extensions
-  # --disable-features=ExtensionManifestV2DeprecationWarning,ExtensionManifestV2Disabled,ExtensionManifestV2Unsupported
+  # IMPORTANT: Do NOT include --disable-gpu or --disable-software-rasterizer!
+  # These flags prevent the Turnstile widget from rendering in Docker containers.
+  # Software rasterization (SwiftShader) is NEEDED for Turnstile to function.
+  # Old --disable-gpu and --disable-software-rasterizer flags were causing
+  # the CAPTCHA to always fail because the challenge iframe couldn't paint.
+
   '--disable-features=OptimizationHints,OptimizationHintsFetching,Translate,OptimizationTargetPrediction,OptimizationGuideModelDownloading,DownloadBubble,DownloadBubbleV2,InsecureDownloadWarnings,InterestFeedContentSuggestions,PrivacySandboxSettings4,SidePanelPinning,UserAgentClientHint,TrustedDOMTypes,BlockInsecurePrivateNetworkRequests',
+  '--enable-features=SharedArrayBuffer,TrustTokens,PrivateNetworkAccessChecksBypassingPermissionPolicy',
   '--no-pings',
   '--animation-duration-scale=0',
   '--wm-window-animations-disabled',
   '--enable-privacy-sandbox-ads-apis',
-  '--lang=en-US',
+  '--lang=en-US,en',
   '--no-default-browser-check',
   '--no-first-run',
   '--no-service-autorun',
   '--password-store=basic',
   '--log-level=3',
   '--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;*.local',
-
-  # IMPORTANT: Do NOT include --disable-software-rasterizer here
-  # In headless Docker containers, software rasterization is NEEDED
-  # for the Turnstile widget to render its challenge iframe.
-  # The old --disable-software-rasterizer flag was preventing
-  # the widget from painting correctly in headless mode.
 }
 
 
@@ -508,18 +510,20 @@ class TurnstileSolver:
     if not playwright:
       playwright = await async_playwright().start()
 
-    # Use headless=True for the modern headless mode that shares the same
-    # rendering engine as headed Chromium.  In Patchright >=1.49,
-    # headless=True already uses the "new" headless mode (the old limited
-    # renderer was removed).  Passing headless="new" as a string is no
-    # longer accepted and causes "expected boolean, got string" errors.
-    headless_mode = True if self.headless else False
+    # ── Headless mode selection ──
+    # Cloudflare Turnstile detects headless browsers and blocks the CAPTCHA.
+    # When running in Docker/Railway, we use Xvfb to provide a virtual display
+    # so the browser can run in headed mode (headless=False). This is the ONLY
+    # reliable way to solve Turnstile — headless=True always fails.
+    #
+    # headless_mode=False = headed browser (uses Xvfb display in Docker)
+    headless_mode = False  # Always use headed mode — Turnstile blocks headless
 
-    # When using headless mode, avoid specifying a channel — patchright's
-    # bundled Chromium is guaranteed to work.  Specifying a channel (e.g.
-    # "chromium") can cause launch failures in Docker/Railway where a
-    # system Chromium may not be installed at the expected path.
-    channel = self.browser if not self.headless else None
+    # ── Channel selection ──
+    # In Docker/Railway, patchright's bundled Chromium is guaranteed to work.
+    # Specifying a channel can cause launch failures where a system Chromium
+    # may not be installed at the expected path.
+    channel = None  # Always use patchright's bundled Chromium
 
     logger.info(f"Launching browser: headless={headless_mode}, channel={channel}, "
                 f"executable_path={self.browser_executable_path}, "
@@ -577,7 +581,7 @@ class TurnstileSolver:
       user_agent=(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Chrome/145.0.0.0 Safari/537.36"
       ),
     )
 
