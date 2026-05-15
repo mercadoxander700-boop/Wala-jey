@@ -13,22 +13,57 @@ HTML_TEMPLATE = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Turnstile Solver</title>
     <script>
-        window.addEventListener("message", m => {{
-           if (m.origin !== "https://challenges.cloudflare.com" || !!m.data === false) return;
+        (function () {{
+          function normalizePayload(data) {{
+            if (!data) return null;
+            // Some runtimes send just the event name as a string.
+            if (typeof data === "string") return {{ event: data }};
+            if (Array.isArray(data)) return null;
+            if (typeof data === "object") {{
+              // Some implementations use `type` instead of `event`.
+              if (!("event" in data) && ("type" in data)) {{
+                return Object.assign({{}}, data, {{ event: data.type }});
+              }}
+              return data;
+            }}
+            return null;
+          }}
 
-           fetch("http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}", {{
-             method: "POST",
-             body: JSON.stringify(m.data),
-             headers: {{
-               "Content-type": "application/json; charset=UTF-8",
-               Secret: "{secret}",
-             }},
-           }})
-          .catch(e => console.error("Error sending message to local server:", e))
-          .then(data => {{
-            console.log("Message sent to local server. Data:", data)
+          function isAllowedOrigin(origin) {{
+            // Be permissive: depending on the underlying patched runtime / iframe
+            // behaviour, origin can be the Turnstile iframe origin or the top-frame.
+            if (!origin || origin === "null") return true;
+            if (origin === window.location.origin) return true;
+            return origin === "https://challenges.cloudflare.com";
+          }}
+
+          window.addEventListener("message", (m) => {{
+            if (!isAllowedOrigin(m.origin)) return;
+            const payload = normalizePayload(m.data);
+            if (!payload || typeof payload.event !== "string") return;
+
+            // Preferred path: Playwright/patchright bridge (avoids mixed-content blocks
+            // when the page is on an HTTPS origin).
+            try {{
+              if (typeof window.__turnstileSolverCallback === "function") {{
+                window.__turnstileSolverCallback(payload);
+                return;
+              }}
+            }} catch (e) {{
+              // Fall back to HTTP callback below.
+            }}
+
+            // Fallback: HTTP callback to the local solver server.
+            fetch("http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}", {{
+              method: "POST",
+              body: JSON.stringify(payload),
+              headers: {{
+                "Content-type": "application/json; charset=UTF-8",
+                Secret: "{secret}",
+              }},
+            }}).catch((e) => console.error("Error sending message to local server:", e));
           }});
-        }});
+        }})();
     </script>
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback"
             async=""

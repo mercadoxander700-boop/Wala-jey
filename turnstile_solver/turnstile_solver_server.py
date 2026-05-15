@@ -128,33 +128,49 @@ class TurnstileSolverServer:
   async def _handle_captcha_message_event(self):
     try:
       logger.debug('Handling captcha message event')
-      data: dict[str, Any] = await request.get_json(force=True)
-      evt: CaptchaApiMessageEvent | str | None = data.pop('event', None)
-      if not evt:
-        return self._bad(f"message has no event entry. Data: {data}", log=True)
-      try:
-        evt = CaptchaApiMessageEvent(evt)
-      except ValueError:
-        return self._bad(f"Unknown event: '{evt}'")
-
+      data = await request.get_json(force=True)
+      if not isinstance(data, dict):
+        return self._bad(f"message must be a JSON object. Got: {type(data).__name__}", log=True)
       if not (id := request.args.get("id")):
         return self._bad("id parameter not specified")
-
-      if not self._captcha_message_event_handlers:
-        return self._error("There's no handlers for handling captcha event", warning=True)
-      else:
-        handler = self._captcha_message_event_handlers.get(id)
-        if not handler:
-          return self._error(f"There's no handler for handling event with ID: {id}", warning=True)
-        if evt != CaptchaApiMessageEvent.FOOD or not self.ignore_food_events:
-          logger.debug(f"Dispatching '{evt.value}' event")
-        if isawaitable(a := handler(evt, data)):
-          await a
+      await self.dispatch_captcha_message_event(id=id, payload=data)
 
     except Exception:
       self.console.print_exception()
       return self._error(self.solver.error, log=False)
     return self._ok()
+
+  async def dispatch_captcha_message_event(self, id: str, payload: dict[str, Any]) -> None:
+    """
+    Dispatch a captcha-api message event to the in-process handler.
+
+    This is used both by the HTTP callback endpoint and by the Playwright
+    `expose_binding` bridge (which avoids mixed-content issues when the page
+    origin is HTTPS).
+    """
+    data: dict[str, Any] = dict(payload)
+    evt: CaptchaApiMessageEvent | str | None = data.pop('event', None) or data.pop('type', None)
+    if not evt:
+      raise ValueError(f"message has no event entry. Data: {data}")
+    try:
+      evt = CaptchaApiMessageEvent(evt)
+    except ValueError:
+      raise ValueError(f"Unknown event: '{evt}'")
+
+    if not self._captcha_message_event_handlers:
+      logger.warning("There's no handlers for handling captcha event")
+      return
+
+    handler = self._captcha_message_event_handlers.get(id)
+    if not handler:
+      logger.warning(f"There's no handler for handling event with ID: {id}")
+      return
+
+    if evt != CaptchaApiMessageEvent.FOOD or not self.ignore_food_events:
+      logger.debug(f"Dispatching '{evt.value}' event")
+
+    if isawaitable(a := handler(evt, data)):
+      await a
 
   async def _solve(self):
     try:

@@ -200,52 +200,84 @@ class TurnstileSolver:
 
         result.page = page
 
-        # 2. Wait for init event (with fallback for newer Chromium)
-        logger.debug(f"Waiting for '{CaptchaApiMessageEvent.INIT.value}' event")
+        # 2. Wait (briefly) for init event.
+        #
+        # In some environments, the 'init' event is not reliably forwarded even
+        # though the widget can still be solved and a token can still appear in
+        # the page. So we treat INIT as best-effort (non-fatal).
+        init_wait = min(timeout, 5)
+        logger.debug(f"Waiting for '{CaptchaApiMessageEvent.INIT.value}' event (up to {init_wait}s)")
         try:
-          if await result.wait_for_captcha_event(evt=CaptchaApiMessageEvent.INIT, timeout=timeout) is False:
+          if await result.wait_for_captcha_event(evt=CaptchaApiMessageEvent.INIT, timeout=init_wait) is False:
             return
         except TimeoutError:
-          logger.warning(f"Captcha API message '{CaptchaApiMessageEvent.INIT.value}' event not received within {timeout} seconds, trying direct solve")
-          # Fallback: try clicking checkbox and polling for token directly
-          try:
-            await result.click_checkbox()
-          except Exception:
-            pass
-          token_val = await self._poll_token(page, timeout=timeout)
-          if token_val:
-            result.token = token_val
-            elapsed = datetime.timedelta(seconds=time.time() - startTime)
-            logger.info(f"Captcha solved via direct poll. Elapsed: {str(elapsed).split('.')[0]}")
-            result.elapsed = elapsed
-            break
-          self._error = f"Captcha event '{CaptchaApiMessageEvent.INIT.value}' not received within {timeout} seconds"
-          continue
+          logger.warning(
+            f"Captcha API message '{CaptchaApiMessageEvent.INIT.value}' event not received within {init_wait} seconds; continuing without it"
+          )
 
         if self._server_down:
           return
 
-        # 3. Wait for 'complete' event
+        # 3. Wait for 'complete' (or cancellation) OR for token to appear.
         try:
           cancellingEvents = [CaptchaApiMessageEvent.REJECT, CaptchaApiMessageEvent.FAIL, CaptchaApiMessageEvent.RELOAD_REQUEST]
           if self.reload_page_on_captcha_overrun_event:
             cancellingEvents.append(CaptchaApiMessageEvent.OVERRUN_BEGIN)
-          if (cancellingEvent := await result.wait_for_captcha_event(
+          poll_task = asyncio.create_task(self._poll_token(page, timeout=timeout), name="poll_turnstile_token")
+          complete_task = asyncio.create_task(
+            result.wait_for_captcha_event(
               *cancellingEvents,
               evt=CaptchaApiMessageEvent.COMPLETE,
               timeout=timeout,
-          )) is False:
+            ),
+            name="wait_turnstile_complete_evt",
+          )
+          done, pending = await asyncio.wait(
+            {poll_task, complete_task},
+            return_when=asyncio.FIRST_COMPLETED,
+          )
+          for t in pending:
+            t.cancel()
+          if pending:
+            # Ensure cancelled tasks don't leak warnings/exceptions.
+            await asyncio.gather(*pending, return_exceptions=True)
+
+          # Token polled directly (works even when captcha API events aren't forwarded)
+          if poll_task in done:
+            token_val = poll_task.result()
+            if token_val:
+              result.token = token_val
+              elapsed = datetime.timedelta(seconds=time.time() - startTime)
+              logger.info(f"Captcha solved via token poll. Elapsed: {str(elapsed).split('.')[0]}")
+              result.elapsed = elapsed
+              break
+
+          # Captcha API event path
+          cancellingEvent = complete_task.result()
+          if cancellingEvent is False:
             return
-          elif isinstance(cancellingEvent, CaptchaApiMessageEvent):
+          if isinstance(cancellingEvent, CaptchaApiMessageEvent):
             logger.warning(f"'{cancellingEvent.value}' event received")
             continue
         except TimeoutError as te:
           self._error = te.args[0]
           logger.warning(f"Captcha not solved within {timeout} seconds")
           continue
+        except asyncio.CancelledError:
+          raise
+        except Exception as ex:
+          self._error = str(ex)
+          logger.warning(f"Captcha solve attempt error: {ex}")
+          continue
 
         if result.token is None:
-          raise RuntimeError("'result.token' is not supposed to be None at this point")
+          # Some sites/runtimes can report COMPLETE without a token payload; try to
+          # pull it directly from the page as a last resort.
+          token_val = await self._poll_token(page, timeout=2)
+          if token_val:
+            result.token = token_val
+          else:
+            raise RuntimeError("'result.token' is not supposed to be None at this point")
 
         elapsed = datetime.timedelta(seconds=time.time() - startTime)
         logger.info(f"Captcha solved. Elapsed: {str(elapsed).split('.')[0]}")
@@ -304,6 +336,22 @@ class TurnstileSolver:
 
     page = await page_or_context.new_page() if isinstance(page_or_context, BrowserContext) else page_or_context
 
+    # Expose a direct Python callback that the page can call to forward Turnstile
+    # messages. This avoids relying on `fetch(http://127.0.0.1/...)`, which can be
+    # blocked as mixed-content when the page origin is HTTPS.
+    async def _turnstile_msg_bridge(source, payload):  # noqa: ARG001
+      try:
+        if isinstance(payload, dict):
+          await self.server.dispatch_captcha_message_event(id=id, payload=payload)
+      except Exception as ex:
+        logger.debug(f"Turnstile message bridge error: {ex}")
+
+    try:
+      await page.expose_binding("__turnstileSolverCallback", _turnstile_msg_bridge)
+    except Exception:
+      # If the page is reused and the binding already exists, ignore.
+      pass
+
     pageContent = c.HTML_TEMPLATE.format(
       local_server_port=self.server.port,
       local_callback_endpoint=CAPTCHA_EVENT_CALLBACK_ENDPOINT.lstrip('/'),
@@ -330,29 +378,6 @@ class TurnstileSolver:
     else:
       logger.debug("Reloading page")
       await page.reload(timeout=self.page_load_timeout * 1000)
-
-    # Inject the message forwarder via evaluate to bypass CSP restrictions
-    callback_js = """() => {{
-      if (window.__turnstileListenerAdded) return;
-      window.__turnstileListenerAdded = true;
-      window.addEventListener("message", m => {{
-        if (m.origin !== "https://challenges.cloudflare.com" || !!m.data === false) return;
-        fetch("http://127.0.0.1:{port}/{endpoint}?id={id}", {{
-          method: "POST",
-          body: JSON.stringify(m.data),
-          headers: {{
-            "Content-type": "application/json; charset=UTF-8",
-            "Secret": "{secret}",
-          }},
-        }}).catch(e => console.error("Callback error:", e));
-      }});
-    }}""".format(
-      port=self.server.port,
-      endpoint=CAPTCHA_EVENT_CALLBACK_ENDPOINT.lstrip('/'),
-      id=id,
-      secret=self.server.secret,
-    )
-    await page.evaluate(callback_js)
 
     page.window_width = await page.evaluate("window.innerWidth")
     page.window_height = await page.evaluate("window.innerHeight")
@@ -387,7 +412,7 @@ class TurnstileSolver:
                                 ) -> tuple[BrowserContext, Playwright]:
 
     if not browser:
-      browser, _ = await self.get_browser(playwright)
+      browser, playwright = await self.get_browser(playwright=playwright, proxy=proxy)
 
     context = await browser.new_context(
       proxy=proxy.dict() if proxy else None,
@@ -397,4 +422,6 @@ class TurnstileSolver:
     # await context.route('**', lambda route: route.continue_())
     # await context.set_extra_http_headers({'HTTP2-Settings': 'MAX_CONCURRENT_STREAMS=100'})
 
+    if playwright is None:
+      raise RuntimeError("Playwright instance is None (this should never happen)")
     return context, playwright
