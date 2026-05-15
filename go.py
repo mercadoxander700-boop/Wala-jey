@@ -368,8 +368,10 @@ async def init_solver(proxy_file: str):
         print(f"=> Solver proxy provider: {len(proxy_provider.proxies)} proxies loaded")
 
         # ── Build solver + server manually ──
+        # IMPORTANT: Do NOT add --disable-gpu or --disable-software-rasterizer here.
+        # These flags prevent the Turnstile widget from rendering correctly in
+        # headless mode. The solver's BROWSER_ARGS already has the correct flags.
         extra_args = [
-            "--disable-gpu",
             "--window-size=1920,1080",
             "--hide-scrollbars",
         ] if HEADLESS else []

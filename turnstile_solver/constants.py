@@ -12,15 +12,41 @@ HTML_TEMPLATE = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Turnstile Solver</title>
+    <style>
+        body {{
+            margin: 0;
+            padding: 20px;
+            background: #ffffff;
+            min-height: 100vh;
+        }}
+        #turnstile-container {{
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 65px;
+        }}
+        .cf-turnstile {{
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            min-width: 300px;
+            min-height: 65px;
+        }}
+        .cf-turnstile iframe {{
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+        }}
+    </style>
     <script>
+        // Message forwarding — must be installed BEFORE the Turnstile script loads
+        // so that we capture the earliest postMessage events.
         (function () {{
           function normalizePayload(data) {{
             if (!data) return null;
-            // Some runtimes send just the event name as a string.
             if (typeof data === "string") return {{ event: data }};
             if (Array.isArray(data)) return null;
             if (typeof data === "object") {{
-              // Some implementations use `type` instead of `event`.
               if (!("event" in data) && ("type" in data)) {{
                 return Object.assign({{}}, data, {{ event: data.type }});
               }}
@@ -30,83 +56,97 @@ HTML_TEMPLATE = '''
           }}
 
           function isAllowedOrigin(origin) {{
-            // Be permissive: depending on the underlying patched runtime / iframe
-            // behaviour, origin can be the Turnstile iframe origin or the top-frame.
             if (!origin || origin === "null") return true;
             if (origin === window.location.origin) return true;
             return origin === "https://challenges.cloudflare.com";
           }}
-
-          // Track message delivery to avoid duplicates
-          const deliveredEvents = new Set();
 
           window.addEventListener("message", (m) => {{
             if (!isAllowedOrigin(m.origin)) return;
             const payload = normalizePayload(m.data);
             if (!payload || typeof payload.event !== "string") return;
 
-            // Avoid duplicate event delivery
-            const eventKey = payload.event + "_" + (payload.timestamp || Date.now());
-            if (deliveredEvents.has(eventKey)) return;
-            deliveredEvents.add(eventKey);
-
-            // Clean up old event keys (keep last 100)
-            if (deliveredEvents.size > 100) {{
-              const keys = Array.from(deliveredEvents);
-              deliveredEvents.clear();
-              keys.slice(-50).forEach(k => deliveredEvents.add(k));
-            }}
-
-            // Preferred path: Playwright/patchright bridge (avoids mixed-content blocks
-            // when the page is on an HTTPS origin).
-            let bridgeSuccess = false;
+            // Preferred: Playwright expose_binding bridge — works even when the
+            // page is served on an HTTPS origin that blocks mixed-content HTTP
+            // requests to 127.0.0.1.
             try {{
               if (typeof window.__turnstileSolverCallback === "function") {{
                 window.__turnstileSolverCallback(payload);
-                bridgeSuccess = true;
                 return;
               }}
             }} catch (e) {{
-              console.warn("Bridge callback failed:", e);
+              // fall through
             }}
 
-            // Fallback: HTTP callback to the local solver server.
-            // Use navigator.sendBeacon for better reliability, fall back to fetch
-            const httpUrl = "http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}";
-            const httpPayload = JSON.stringify(payload);
-
+            // Fallback: HTTP callback
             try {{
-              // Try sendBeacon first (more reliable for page unload scenarios)
-              if (navigator.sendBeacon) {{
-                const blob = new Blob([httpPayload], {{ type: "application/json" }});
-                if (navigator.sendBeacon(httpUrl, blob)) {{
-                  return;
-                }}
-              }}
-            }} catch (e) {{
-              console.warn("sendBeacon failed:", e);
-            }}
-
-            // Fall back to fetch
-            fetch(httpUrl, {{
-              method: "POST",
-              body: httpPayload,
-              headers: {{
-                "Content-type": "application/json; charset=UTF-8",
-                Secret: "{secret}",
-              }},
-              keepalive: true,
-            }}).catch((e) => console.error("Error sending message to local server:", e));
+              fetch("http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}", {{
+                method: "POST",
+                body: JSON.stringify(payload),
+                headers: {{
+                  "Content-type": "application/json; charset=UTF-8",
+                  "Secret": "{secret}",
+                }},
+                keepalive: true,
+              }}).catch(() => {{}});
+            }} catch (e) {{}}
           }});
         }})();
     </script>
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback"
-            async=""
-            defer="">
+    <script>
+        // Turnstile explicit rendering callback
+        window.onLoadTurnstileCallback = function () {{
+          var container = document.querySelector('.cf-turnstile');
+          if (container && window.turnstile) {{
+            try {{
+              window.turnstile.render(container, {{
+                sitekey: '{site_key}',
+                callback: function(token) {{
+                  // Directly inject the token into a hidden field for reliable polling
+                  var input = document.querySelector('[name=cf-turnstile-response]');
+                  if (!input) {{
+                    input = document.createElement('input');
+                    input.type = 'hidden';
+                    input.name = 'cf-turnstile-response';
+                    document.body.appendChild(input);
+                  }}
+                  input.value = token;
+
+                  // Also fire a message event so the solver's bridge picks it up
+                  window.postMessage({{
+                    event: 'complete',
+                    token: token
+                  }}, '*');
+                }},
+                'error-callback': function(err) {{
+                  console.error('Turnstile error:', err);
+                  window.postMessage({{ event: 'fail', error: err }}, '*');
+                }},
+                'expired-callback': function() {{
+                  window.postMessage({{ event: 'tokenExpired' }}, '*');
+                }},
+                'timeout-callback': function() {{
+                  window.postMessage({{ event: 'interactiveTimeout' }}, '*');
+                }},
+              }});
+              // Force the container to be visible after render
+              container.style.display = 'block';
+              container.style.visibility = 'visible';
+              container.style.opacity = '1';
+            }} catch (e) {{
+              console.error('Turnstile render error:', e);
+            }}
+          }}
+        }};
+    </script>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onLoadTurnstileCallback&render=explicit"
+            async="">
     </script>
 </head>
 <body>
-<div class="cf-turnstile" data-sitekey="{site_key}" style="display: inline-block; background: white;"></div>
+<div id="turnstile-container">
+  <div class="cf-turnstile" data-sitekey="{site_key}"></div>
+</div>
 </body>
 </html>
 '''

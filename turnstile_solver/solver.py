@@ -20,7 +20,6 @@ BROWSER_ARGS = {
   "--no-sandbox",
   "--disable-dev-shm-usage",
   "--disable-setuid-sandbox",
-  "--disable-software-rasterizer",
 
   "--disable-blink-features=AutomationControlled",  # avoid navigator.webdriver detection
   "--disable-background-networking",
@@ -56,7 +55,6 @@ BROWSER_ARGS = {
   # renders correctly and the page content is fully laid out even when
   # there is no physical display (Railway / Docker / CI).
   '--disable-gpu',                       # avoid GPU-related crashes in containers
-  '--disable-software-rasterizer',        # redundant safety for GPU disable
   '--window-size=1920,1080',              # explicit viewport so widget paints fully
   '--hide-scrollbars',                    # clean screenshots / rendering
 
@@ -64,11 +62,9 @@ BROWSER_ARGS = {
   # --disable-features=ExtensionManifestV2DeprecationWarning,ExtensionManifestV2Disabled,ExtensionManifestV2Unsupported
   '--disable-features=OptimizationHints,OptimizationHintsFetching,Translate,OptimizationTargetPrediction,OptimizationGuideModelDownloading,DownloadBubble,DownloadBubbleV2,InsecureDownloadWarnings,InterestFeedContentSuggestions,PrivacySandboxSettings4,SidePanelPinning,UserAgentClientHint,TrustedDOMTypes,BlockInsecurePrivateNetworkRequests',
   '--no-pings',
-  # '--homepage=chrome://version/',
   '--animation-duration-scale=0',
   '--wm-window-animations-disabled',
   '--enable-privacy-sandbox-ads-apis',
-  # '--disable-popup-blocking',
   '--lang=en-US',
   '--no-default-browser-check',
   '--no-first-run',
@@ -77,21 +73,11 @@ BROWSER_ARGS = {
   '--log-level=3',
   '--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;*.local',
 
-  # Not needed, here just for reference
-  # Network/Connection Tuning
-  # '--enable-features=NetworkService,ParallelDownloading',
-  # '--max-connections=255',  # Total active connections
-  # '--max-parallel-downloads=50',  # Concurrent downloads
-  # '--socket-reuse-policy=2',  # Aggressive socket reuse
-
-  # Thread/Process Management
-  # '--renderer-process-limit=0',  # Unlimited renderers
-  # '--in-process-gpu',  # Reduce process count # NO
-  # '--disable-site-isolation-trials',  # Prevent tab grouping # NO
-
-  # Protocol-Specific
-  # '--http2-no-coalesce-host',  # Bypass HTTP/2 coalescing
-  # '--force-http2-hpack-huffman=off',  # Reduce HPACK overhead
+  # IMPORTANT: Do NOT include --disable-software-rasterizer here
+  # In headless Docker containers, software rasterization is NEEDED
+  # for the Turnstile widget to render its challenge iframe.
+  # The old --disable-software-rasterizer flag was preventing
+  # the widget from painting correctly in headless mode.
 }
 
 
@@ -312,52 +298,104 @@ class TurnstileSolver:
   async def _poll_token(self, page: Page, timeout: float = 30, interval: float = 0.5) -> str | None:
     """Poll the page for a solved Turnstile token value."""
     end_time = time.time() + timeout
-    click_attempted = False
-    iframe_click_attempted = False
     last_click_time = 0
+    widget_click_count = 0
+    iframe_click_count = 0
 
     while time.time() < end_time:
       try:
-        # Check for token in multiple possible locations
-        token = await page.evaluate(
-          "document.querySelector('[name=cf-turnstile-response]')?.value || "
-          "document.querySelector('textarea[name=cf-turnstile-response]')?.value || "
-          "''"
-        )
-        if token and len(token) > 10:  # Valid tokens are typically longer
-          logger.debug(f"Token found: {token[:30]}...")
+        # Check for token in multiple possible selectors
+        token = await page.evaluate("""
+          (() => {
+            // Standard hidden input
+            const el1 = document.querySelector('[name=cf-turnstile-response]');
+            if (el1 && el1.value && el1.value.length > 10) return el1.value;
+            // Textarea variant
+            const el2 = document.querySelector('textarea[name=cf-turnstile-response]');
+            if (el2 && el2.value && el2.value.length > 10) return el2.value;
+            // Check inside the Turnstile iframe (some implementations)
+            try {
+              const iframe = document.querySelector('.cf-turnstile iframe');
+              if (iframe && iframe.contentDocument) {
+                const el3 = iframe.contentDocument.querySelector('[name=cf-turnstile-response]');
+                if (el3 && el3.value && el3.value.length > 10) return el3.value;
+              }
+            } catch(e) {}
+            return '';
+          })()
+        """)
+        if token and len(token) > 10:
+          logger.info(f"Token found: {token[:30]}...")
           return token
 
         current_time = time.time()
 
-        # Try clicking the checkbox periodically — in headless mode the widget
-        # sometimes needs an explicit click to trigger the challenge flow.
-        # Click more frequently in headless mode
-        if not click_attempted or (current_time - last_click_time > 2):
+        # Periodically click the Turnstile widget to trigger the challenge flow.
+        # In headless mode, the widget may need an explicit click.
+        if current_time - last_click_time > 2:
+          # Strategy 1: Click the outer container
           try:
-            # First try the outer container
-            await page.locator('.cf-turnstile').click(timeout=1500)
-            click_attempted = True
-            last_click_time = current_time
-            logger.debug("Clicked Turnstile widget (outer container)")
+            widget = page.locator('.cf-turnstile')
+            if await widget.count() > 0:
+              await widget.click(timeout=1500, force=True)
+              widget_click_count += 1
+              last_click_time = current_time
+              logger.debug(f"Clicked Turnstile widget ({widget_click_count}x)")
           except Exception as e:
-            logger.debug(f"Outer container click failed: {e}")
+            logger.debug(f"Widget click failed: {e}")
+
+            # Strategy 2: Click inside the Turnstile iframe
             try:
-              # Fallback: click inside the iframe if present
-              if not iframe_click_attempted or (current_time - last_click_time > 3):
+              iframe = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+              await iframe.locator('body').click(timeout=1000)
+              iframe_click_count += 1
+              last_click_time = current_time
+              logger.debug(f"Clicked Turnstile iframe ({iframe_click_count}x)")
+            except Exception:
+              try:
+                # Alternate iframe selector
                 iframe = page.frame_locator('iframe[title*="Cloudflare"]')
                 await iframe.locator('body').click(timeout=1000)
-                iframe_click_attempted = True
+                iframe_click_count += 1
                 last_click_time = current_time
-                logger.debug("Clicked Turnstile widget (iframe)")
-            except Exception as iframe_e:
-              logger.debug(f"Iframe click failed: {iframe_e}")
+                logger.debug(f"Clicked Cloudflare iframe ({iframe_click_count}x)")
+              except Exception as iframe_e:
+                logger.debug(f"Iframe click failed: {iframe_e}")
+
+          # Strategy 3: Use JavaScript to force-check the checkbox inside iframe
+          if widget_click_count > 2 and iframe_click_count == 0:
+            try:
+              await page.evaluate("""
+                (() => {
+                  const frames = document.querySelectorAll('iframe');
+                  for (const frame of frames) {
+                    if (frame.src && frame.src.includes('cloudflare')) {
+                      frame.style.display = 'block';
+                      frame.style.visibility = 'visible';
+                      frame.style.opacity = '1';
+                      frame.style.width = '300px';
+                      frame.style.height = '65px';
+                    }
+                  }
+                  const container = document.querySelector('.cf-turnstile');
+                  if (container) {
+                    container.style.display = 'block';
+                    container.style.visibility = 'visible';
+                    container.style.opacity = '1';
+                    container.style.minHeight = '65px';
+                    container.style.minWidth = '300px';
+                  }
+                })()
+              """)
+            except Exception:
+              pass
+
       except Exception as e:
         logger.debug(f"Token poll error: {e}")
 
       await asyncio.sleep(interval)
 
-    logger.warning(f"Token not found after {timeout}s")
+    logger.warning(f"Token not found after {timeout}s (widget_clicks={widget_click_count}, iframe_clicks={iframe_click_count})")
     return None
 
   async def _setup_page(
@@ -416,13 +454,44 @@ class TurnstileSolver:
       logger.debug("Reloading page")
       await page.reload(timeout=self.page_load_timeout * 1000)
 
-    # Wait for the Turnstile widget to be present in the DOM.
-    # In headless mode, the widget may take a moment to render.
+    # Wait for the Turnstile widget div to be attached to the DOM.
+    # Use state="attached" because the widget may be hidden initially
+    # (the Turnstile JS will make it visible once it loads the iframe).
     try:
-      await page.wait_for_selector('.cf-turnstile', timeout=10000)
-      logger.debug("Turnstile widget found in DOM")
+      await page.wait_for_selector('.cf-turnstile', state="attached", timeout=15000)
+      logger.debug("Turnstile widget div attached to DOM")
     except Exception as e:
-      logger.warning(f"Turnstile widget not found after 10s: {e}")
+      logger.warning(f"Turnstile widget div not attached after 15s: {e}")
+
+    # Wait a moment for the Turnstile iframe to appear inside the container.
+    # The widget loading the challenge iframe is a strong signal that
+    # Turnstile initialised correctly.
+    try:
+      await page.wait_for_selector('.cf-turnstile iframe', state="attached", timeout=20000)
+      logger.debug("Turnstile challenge iframe attached")
+    except Exception as e:
+      logger.warning(f"Turnstile challenge iframe not found after 20s: {e}")
+
+    # Try to force widget visibility via JS in case it is still hidden
+    try:
+      await page.evaluate("""
+        const el = document.querySelector('.cf-turnstile');
+        if (el) {
+          el.style.display = 'block';
+          el.style.visibility = 'visible';
+          el.style.opacity = '1';
+          el.style.minHeight = '65px';
+          el.style.minWidth = '300px';
+        }
+        const container = document.getElementById('turnstile-container');
+        if (container) {
+          container.style.display = 'flex';
+          container.style.visibility = 'visible';
+          container.style.minHeight = '65px';
+        }
+      """)
+    except Exception as e:
+      logger.debug(f"Force visibility script error: {e}")
 
     page.window_width = await page.evaluate("window.innerWidth")
     page.window_height = await page.evaluate("window.innerHeight")
