@@ -190,7 +190,7 @@ class TurnstileSolver:
 
         result.reset_captcha_fields()
 
-        # 1. Route and load page, reset captcha fields
+        # 1. Route and load page, set up event collector
         if not (page := await self._setup_page(
             page_or_context=result.page or pageOrContext,
             site_url=site_url,
@@ -201,92 +201,119 @@ class TurnstileSolver:
 
         result.page = page
 
-        # 2. Wait (briefly) for init event.
-        # In some environments, the 'init' event is not reliably forwarded even
-        # though the widget can still be solved and a token can still appear in
-        # the page. So we treat INIT as best-effort (non-fatal).
-        init_wait = min(timeout, 5)
-        logger.debug(f"Waiting for '{CaptchaApiMessageEvent.INIT.value}' event (up to {init_wait}s)")
-        try:
-          if await result.wait_for_captcha_event(evt=CaptchaApiMessageEvent.INIT, timeout=init_wait) is False:
-            return
-        except TimeoutError:
-          logger.warning(
-            f"Captcha API message '{CaptchaApiMessageEvent.INIT.value}' event not received within {init_wait} seconds; continuing without it"
-          )
+        # 2. Start the evaluate-polling event bridge. This replaces the
+        #    broken fetch()-to-HTTP-server bridge (blocked by mixed-content
+        #    policy when the page is served over HTTPS) and the broken
+        #    expose_binding bridge (Patchright strips injected bindings).
+        #    The bridge polls window.__cfEvents via page.evaluate() and
+        #    dispatches each event to the server's handler directly.
+        last_event_idx = 0
+        poll_start = time.time()
+        init_received = False
+        token_found = False
 
-        if self._server_down:
-          return
+        while time.time() - poll_start < timeout:
+          # ── Poll events from the page ──
+          try:
+            new_events, last_event_idx = await self._poll_events(page, last_event_idx)
+          except Exception as e:
+            logger.debug(f"Event poll error: {e}")
+            await asyncio.sleep(0.3)
+            continue
 
-        # 3. Wait for 'complete' (or cancellation) OR for token to appear.
-        try:
+          # ── Dispatch each new event to the handler ──
+          for evt_data in new_events:
+            evt_name = evt_data.get('event') or evt_data.get('type')
+            if not evt_name:
+              continue
+            try:
+              await self.server.dispatch_captcha_message_event(
+                id=result.id, payload=evt_data
+              )
+            except Exception as e:
+              logger.debug(f"Event dispatch error for '{evt_name}': {e}")
+
+            if evt_name == CaptchaApiMessageEvent.INIT.value:
+              init_received = True
+              logger.info("Captcha 'init' event received via evaluate polling")
+
+          # ── Check for cancellation events ──
           cancellingEvents = [CaptchaApiMessageEvent.REJECT, CaptchaApiMessageEvent.FAIL, CaptchaApiMessageEvent.RELOAD_REQUEST]
           if self.reload_page_on_captcha_overrun_event:
             cancellingEvents.append(CaptchaApiMessageEvent.OVERRUN_BEGIN)
-          poll_task = asyncio.create_task(self._poll_token(page, timeout=timeout), name="poll_turnstile_token")
-          complete_task = asyncio.create_task(
-            result.wait_for_captcha_event(
-              *cancellingEvents,
-              evt=CaptchaApiMessageEvent.COMPLETE,
-              timeout=timeout,
-            ),
-            name="wait_turnstile_complete_evt",
-          )
-          done, pending = await asyncio.wait(
-            {poll_task, complete_task},
-            return_when=asyncio.FIRST_COMPLETED,
-          )
-          for t in pending:
-            t.cancel()
-          if pending:
-            # Ensure cancelled tasks don't leak warnings/exceptions.
-            await asyncio.gather(*pending, return_exceptions=True)
 
-          # Token polled directly (works even when captcha API events aren't forwarded)
-          if poll_task in done:
-            token_val = poll_task.result()
+          for ce in cancellingEvents:
+            if ce in result._received_captcha_events:
+              logger.warning(f"'{ce.value}' event received — retrying")
+              break
+          else:
+            # No cancellation event — check for completion
+            pass
+
+          # Check if we got a cancelling event
+          cancelled = False
+          for ce in cancellingEvents:
+            if ce in result._received_captcha_events:
+              cancelled = True
+              break
+          if cancelled:
+            break
+
+          # ── Check for token ──
+          # 1. From the COMPLETE event (via the handler)
+          if result.token:
+            token_found = True
+            break
+
+          # 2. Directly from the page's hidden input (works even without events)
+          try:
+            token_val = await self._poll_token(page, timeout=0.1)
             if token_val:
               result.token = token_val
-              elapsed = datetime.timedelta(seconds=time.time() - startTime)
-              logger.info(f"Captcha solved via token poll. Elapsed: {str(elapsed).split('.')[0]}")
-              result.elapsed = elapsed
+              token_found = True
+              logger.info(f"Token found via input polling: {token_val[:30]}...")
               break
+          except Exception:
+            pass
 
-          # Captcha API event path
-          cancellingEvent = complete_task.result()
-          if cancellingEvent is False:
-            return
-          if isinstance(cancellingEvent, CaptchaApiMessageEvent):
-            logger.warning(f"'{cancellingEvent.value}' event received")
-            continue
-        except TimeoutError as te:
-          self._error = te.args[0]
-          logger.warning(f"Captcha not solved within {timeout} seconds")
+          # ── Brief sleep before next poll ──
+          await asyncio.sleep(0.3)
+
+        # ── Handle results ──
+        if token_found or result.token:
+          elapsed = datetime.timedelta(seconds=time.time() - startTime)
+          logger.info(f"Captcha solved. Elapsed: {str(elapsed).split('.')[0]}")
+          logger.debug(f"TOKEN: {result.token}")
+          result.elapsed = elapsed
+          break
+
+        if not init_received:
+          logger.warning(
+            f"Captcha API message 'init' event not received within {timeout} seconds; "
+            f"continuing without it"
+          )
+
+        # Check for cancellation events that triggered a retry
+        cancelled = False
+        cancellingEvents = [CaptchaApiMessageEvent.REJECT, CaptchaApiMessageEvent.FAIL, CaptchaApiMessageEvent.RELOAD_REQUEST]
+        if self.reload_page_on_captcha_overrun_event:
+          cancellingEvents.append(CaptchaApiMessageEvent.OVERRUN_BEGIN)
+        for ce in cancellingEvents:
+          if ce in result._received_captcha_events:
+            cancelled = True
+            break
+        if cancelled:
           continue
-        except asyncio.CancelledError:
-          raise
-        except Exception as ex:
-          self._error = str(ex)
-          logger.warning(f"Captcha solve attempt error: {ex}")
-          continue
 
-        if result.token is None:
-          # Some sites/runtimes can report COMPLETE without a token payload; try to
-          # pull it directly from the page as a last resort.
-          token_val = await self._poll_token(page, timeout=2)
-          if token_val:
-            result.token = token_val
-          else:
-            raise RuntimeError("'result.token' is not supposed to be None at this point")
-
-        elapsed = datetime.timedelta(seconds=time.time() - startTime)
-        logger.info(f"Captcha solved. Elapsed: {str(elapsed).split('.')[0]}")
-        logger.debug(f"TOKEN: {result.token}")
-        result.elapsed = elapsed
-        break
+        self._error = f"Captcha not solved within {timeout} seconds"
+        logger.warning(self._error)
+        continue
 
       if about_blank_on_finish:
-        await page.goto("about:blank")
+        try:
+          await page.goto("about:blank")
+        except Exception:
+          pass
       if result.token:
         return result
       self._error = f"Captcha failed to solve in {attempts} attempts :("
@@ -294,19 +321,37 @@ class TurnstileSolver:
     except Exception as ex:
       self._error = str(ex)
       raise
-      # logger.error(ex)
     finally:
       self.server.unsubscribe_captcha_message_event_handler(result.id)
       for callback in onFinishCallbacks:
         await callback()
 
+  async def _poll_events(self, page: Page, last_idx: int) -> tuple[list[dict], int]:
+    """Poll the page's __cfEvents array for new events since last_idx.
+
+    Returns (new_events, new_last_idx). Events are collected by the
+    window message listener in the HTML template and stored in
+    window.__cfEvents. Python polls this array via page.evaluate()
+    to dispatch events to the server handler — this avoids both
+    mixed-content blocking (fetch from HTTPS to HTTP localhost) and
+    Patchright's broken expose_binding mechanism.
+    """
+    result = await page.evaluate("""() => {
+      if (!window.__cfEvents) return {events: [], idx: 0};
+      const newEvents = window.__cfEvents.slice(%d);
+      return {events: newEvents, idx: window.__cfEvents.length};
+    }""" % last_idx)
+
+    new_events = result.get('events', [])
+    new_idx = result.get('idx', last_idx)
+    return new_events, new_idx
+
   async def _poll_token(self, page: Page, timeout: float = 30, interval: float = 0.5) -> str | None:
     """Poll the page for a solved Turnstile token value.
 
-    This is the simple, proven approach: just check the hidden input
-    that Turnstile auto-creates when using auto-render mode. No complex
-    clicking or iframe manipulation — the Turnstile JS handles all of that
-    when it can render properly in a headed browser with SwiftShader.
+    This checks the hidden input that Turnstile auto-creates when using
+    auto-render mode. Works even when the captcha API events are not
+    forwarded (e.g. mixed-content blocking).
     """
     end_time = time.time() + timeout
 
@@ -322,7 +367,6 @@ class TurnstileSolver:
           })()
         """)
         if token and len(token) > 10:
-          logger.info(f"Token found via input value: {token[:30]}...")
           return token
 
         # Also try the textarea variant (some Turnstile versions)
@@ -334,15 +378,15 @@ class TurnstileSolver:
           })()
         """)
         if token and len(token) > 10:
-          logger.info(f"Token found via textarea: {token[:30]}...")
           return token
 
       except Exception as e:
         logger.debug(f"Token poll error: {e}")
 
-      await asyncio.sleep(interval)
+      if time.time() >= end_time:
+        break
+      await asyncio.sleep(min(interval, end_time - time.time()))
 
-    logger.warning(f"Token not found after {timeout}s")
     return None
 
   async def _setup_page(
@@ -376,6 +420,16 @@ class TurnstileSolver:
         },
       )
 
+    # ── Fix page reuse: remove old routes before adding new ones ──
+    # When pages are reused (about_blank_on_finish=True), the page may
+    # already have a route for site_url from a previous solve attempt.
+    # Adding another route without removing the old one causes route
+    # accumulation, which leads to unpredictable behavior.
+    try:
+      await page.unroute(site_url)
+    except Exception:
+      pass  # No existing route — that's fine
+
     await page.route(site_url, _fulfill)
 
     if page.url != site_url:
@@ -384,6 +438,28 @@ class TurnstileSolver:
     else:
       logger.debug("Reloading page")
       await page.reload(timeout=self.page_load_timeout * 1000)
+
+    # ── Set up the event collector via page.evaluate() ──
+    # The HTML template defines window.__cfEvents and the message listener,
+    # but Patchright's route fulfillment may execute the JS in a separate
+    # context where the variables aren't accessible to page.evaluate().
+    # We re-initialize them here to ensure they're in the page's main world.
+    try:
+      await page.evaluate("""() => {
+        if (!window.__cfEvents) window.__cfEvents = [];
+        if (!window.__cfEventIdx) window.__cfEventIdx = 0;
+        // Re-ensure the message listener is set up (idempotent)
+        if (!window.__cfListenerAdded) {
+          window.addEventListener('message', function(m) {
+            if (m.origin !== 'https://challenges.cloudflare.com' || !m.data) return;
+            try { window.__cfEvents.push(JSON.parse(JSON.stringify(m.data))); } catch(e) {}
+          });
+          window.__cfListenerAdded = true;
+        }
+      }""")
+      logger.debug("Event collector initialized via evaluate()")
+    except Exception as e:
+      logger.warning(f"Failed to initialize event collector via evaluate(): {e}")
 
     # Wait for the Turnstile widget div to be attached to the DOM.
     try:

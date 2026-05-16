@@ -20,27 +20,24 @@ HTML_TEMPLATE = '''
         }}
     </style>
     <script>
-        // Forward postMessage events from the Turnstile iframe to the local
-        // solver server. This is the simple, proven approach from the working
-        // odell0111 original — no normalization, no expose_binding, no fallbacks.
-        window.addEventListener("message", (m) => {{
+        // Collect postMessage events from the Turnstile iframe into a global array.
+        // The Python solver polls this array via page.evaluate() to dispatch events
+        // to the handler. This avoids mixed-content blocking (fetch from HTTPS page
+        // to HTTP localhost is blocked by browsers) and works in Patchright where
+        // expose_binding and page.on('console') are broken.
+        window.__cfEvents = window.__cfEvents || [];
+        window.__cfEventIdx = window.__cfEventIdx || 0;
+        window.addEventListener("message", function(m) {{
             if (m.origin !== "https://challenges.cloudflare.com" || !!m.data === false) return;
-            fetch("http://127.0.0.1:{local_server_port}/{local_callback_endpoint}?id={id}", {{
-                method: "POST",
-                body: JSON.stringify(m.data),
-                headers: {{
-                    "Content-type": "application/json; charset=UTF-8",
-                    "Secret": "{secret}",
-                }},
-            }})
-            .catch(e => console.error("Error sending message to local server:", e))
-            .then(data => {{ console.log("Message sent to local server. Data:", data) }});
+            try {{
+                window.__cfEvents.push(JSON.parse(JSON.stringify(m.data)));
+            }} catch(e) {{}}
         }});
     </script>
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async="" defer=""></script>
     <script>
         function onloadTurnstileCallback() {{
-            console.log("Turnstile API loaded (auto-render mode)");
+            document.title = "Turnstile API loaded";
         }}
     </script>
 </head>
@@ -60,11 +57,11 @@ CAPTCHA_EVENT_CALLBACK_ENDPOINT = '/api_js_message_callback'
 
 SECRET = "jWRN7DH6"
 
-MAX_ATTEMPTS_TO_SOLVE_CAPTCHA = 3
-CAPTCHA_ATTEMPT_TIMEOUT = 30
+MAX_ATTEMPTS_TO_SOLVE_CAPTCHA = 5
+CAPTCHA_ATTEMPT_TIMEOUT = 60
 MAX_CONTEXTS = 40
 MAX_PAGES_PER_CONTEXT = 2
-PAGE_LOAD_TIMEOUT = 30
+PAGE_LOAD_TIMEOUT = 60
 BROWSER_POSITION = 2000, 2000
 BROWSER = "chromium"
 BROWSERS = [

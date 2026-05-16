@@ -396,13 +396,13 @@ async def init_solver(proxy_file: str):
 
         solver = TurnstileSolver(
             server=solver_server,
-            page_load_timeout=30,
+            page_load_timeout=60,
             browser_position=(2000, 2000),
             browser_executable_path=None,
             browser="chromium",
             reload_page_on_captcha_overrun_event=False,
             max_attempts=5,
-            attempt_timeout=30,
+            attempt_timeout=60,
             headless=False,  # MUST be False — Turnstile blocks headless browsers. Xvfb provides virtual display.
             console=None,
             log_level=logging.INFO,
