@@ -12,25 +12,6 @@ from turnstile_solver.utils import password
 
 logger = logging.getLogger(__name__)
 
-_CLICK_CHECKBOX_SCRIPT = """
-  // Ensure the widget is visible before trying to interact
-  const container = document.querySelector('.cf-turnstile');
-  if (container) {
-    container.style.display = 'block';
-    container.style.visibility = 'visible';
-    container.style.opacity = '1';
-    container.style.minHeight = '65px';
-    container.style.minWidth = '300px';
-  }
-  // Ensure iframes are visible too
-  const iframes = document.querySelectorAll('.cf-turnstile iframe');
-  iframes.forEach(f => {
-    f.style.display = 'block';
-    f.style.visibility = 'visible';
-    f.style.opacity = '1';
-  });
-"""
-
 
 class TurnstileResult:
   def __init__(self,
@@ -83,27 +64,16 @@ class TurnstileResult:
       await asyncio.sleep(sleep_time)
 
   async def click_checkbox(self, page: Page | None = None):
-    page = page or self.page
-    # First ensure the widget is visible
-    await page.evaluate(_CLICK_CHECKBOX_SCRIPT)
-    await asyncio.sleep(0.3)
+    """Click the Turnstile checkbox widget.
 
-    # Try clicking the Turnstile widget — use force=True because the widget
-    # may still report as hidden even after our visibility overrides.
+    In auto-render mode with a properly configured headed browser (SwiftShader,
+    Xvfb), the widget renders correctly and a simple click on the .cf-turnstile
+    div is sufficient to trigger the challenge flow. No visibility overrides or
+    iframe manipulation needed — those were causing more harm than good.
+    """
+    page = page or self.page
     try:
-      await page.locator('.cf-turnstile').click(timeout=2000, force=True)
-      logger.debug("Attempt to click checkbox performed (outer container)")
+      await page.locator('.cf-turnstile').click(timeout=3000, force=True)
+      logger.debug("Clicked Turnstile widget")
     except Exception as e:
-      logger.debug(f"Outer click failed: {e}")
-      try:
-        # Try clicking inside the Cloudflare iframe
-        iframe = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-        await iframe.locator('body').click(timeout=1500)
-        logger.debug("Attempt to click checkbox performed (iframe)")
-      except Exception:
-        try:
-          iframe = page.frame_locator('iframe[title*="Cloudflare"]')
-          await iframe.locator('body').click(timeout=1500)
-          logger.debug("Attempt to click checkbox performed (alt iframe)")
-        except TimeoutError:
-          logger.error("Captcha widget click timed-out")
+      logger.debug(f"Widget click failed: {e}")

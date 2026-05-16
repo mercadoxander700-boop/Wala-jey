@@ -16,12 +16,11 @@ from turnstile_solver.turnstile_solver_server import TurnstileSolverServer, CAPT
 logger = logging.getLogger(__name__)
 
 BROWSER_ARGS = {
-
   "--no-sandbox",
   "--disable-dev-shm-usage",
   "--disable-setuid-sandbox",
 
-  "--disable-blink-features=AutomationControlled",  # avoid navigator.webdriver detection
+  "--disable-blink-features=AutomationControlled",
   "--disable-background-networking",
   "--disable-background-timer-throttling",
   "--disable-backgrounding-occluded-windows",
@@ -54,18 +53,23 @@ BROWSER_ARGS = {
   # ── Docker / Xvfb rendering essentials ──
   # These flags are CRITICAL for Turnstile to work inside containers.
   # Turnstile uses WebGL/WebGPU fingerprinting — without these it detects
-  # a headless/non-rendering environment and blocks the CAPTCHA.
-  '--use-gl=swiftshader',             # software OpenGL — no real GPU in Docker
-  '--enable-webgl',                   # Turnstile checks for WebGL support
-  '--enable-unsafe-webgpu',           # some Turnstile challenges use WebGPU
-  '--start-maximized',                # full viewport for widget rendering
-  '--window-size=1920,1080',          # explicit viewport so widget paints fully
-
-  # IMPORTANT: Do NOT include --disable-gpu or --disable-software-rasterizer!
-  # These flags prevent the Turnstile widget from rendering in Docker containers.
-  # Software rasterization (SwiftShader) is NEEDED for Turnstile to function.
-  # Old --disable-gpu and --disable-software-rasterizer flags were causing
-  # the CAPTCHA to always fail because the challenge iframe couldn't paint.
+  # a non-rendering environment and blocks the CAPTCHA.
+  #
+  # The working Docker setup (odell0111 PR #4) uses BOTH --disable-gpu AND
+  # --use-gl=swiftshader. This is NOT contradictory:
+  #   --disable-gpu                disables HARDWARE GPU (no GPU in Docker)
+  #   --use-gl=swiftshader         enables SOFTWARE GL via SwiftShader
+  #   --disable-software-rasterizer  disables the default software rasterizer
+  #                                 so SwiftShader is used instead
+  #   --enable-webgl               Turnstile checks for WebGL support
+  #   --enable-unsafe-webgpu       some Turnstile challenges use WebGPU
+  '--disable-gpu',
+  '--disable-software-rasterizer',
+  '--use-gl=swiftshader',
+  '--enable-webgl',
+  '--enable-unsafe-webgpu',
+  '--start-maximized',
+  '--window-size=1024,720',
 
   '--disable-features=OptimizationHints,OptimizationHintsFetching,Translate,OptimizationTargetPrediction,OptimizationGuideModelDownloading,DownloadBubble,DownloadBubbleV2,InsecureDownloadWarnings,InterestFeedContentSuggestions,PrivacySandboxSettings4,SidePanelPinning,UserAgentClientHint,TrustedDOMTypes,BlockInsecurePrivateNetworkRequests',
   '--enable-features=SharedArrayBuffer,TrustTokens,PrivateNetworkAccessChecksBypassingPermissionPolicy',
@@ -198,7 +202,6 @@ class TurnstileSolver:
         result.page = page
 
         # 2. Wait (briefly) for init event.
-        #
         # In some environments, the 'init' event is not reliably forwarded even
         # though the widget can still be solved and a token can still appear in
         # the page. So we treat INIT as best-effort (non-fatal).
@@ -298,106 +301,48 @@ class TurnstileSolver:
         await callback()
 
   async def _poll_token(self, page: Page, timeout: float = 30, interval: float = 0.5) -> str | None:
-    """Poll the page for a solved Turnstile token value."""
+    """Poll the page for a solved Turnstile token value.
+
+    This is the simple, proven approach: just check the hidden input
+    that Turnstile auto-creates when using auto-render mode. No complex
+    clicking or iframe manipulation — the Turnstile JS handles all of that
+    when it can render properly in a headed browser with SwiftShader.
+    """
     end_time = time.time() + timeout
-    last_click_time = 0
-    widget_click_count = 0
-    iframe_click_count = 0
 
     while time.time() < end_time:
       try:
-        # Check for token in multiple possible selectors
+        # The auto-render mode creates a hidden input named cf-turnstile-response
+        # and populates it with the token when the challenge is solved.
         token = await page.evaluate("""
           (() => {
-            // Standard hidden input
-            const el1 = document.querySelector('[name=cf-turnstile-response]');
-            if (el1 && el1.value && el1.value.length > 10) return el1.value;
-            // Textarea variant
-            const el2 = document.querySelector('textarea[name=cf-turnstile-response]');
-            if (el2 && el2.value && el2.value.length > 10) return el2.value;
-            // Check inside the Turnstile iframe (some implementations)
-            try {
-              const iframe = document.querySelector('.cf-turnstile iframe');
-              if (iframe && iframe.contentDocument) {
-                const el3 = iframe.contentDocument.querySelector('[name=cf-turnstile-response]');
-                if (el3 && el3.value && el3.value.length > 10) return el3.value;
-              }
-            } catch(e) {}
+            const el = document.querySelector('[name=cf-turnstile-response]');
+            if (el && el.value && el.value.length > 10) return el.value;
             return '';
           })()
         """)
         if token and len(token) > 10:
-          logger.info(f"Token found: {token[:30]}...")
+          logger.info(f"Token found via input value: {token[:30]}...")
           return token
 
-        current_time = time.time()
-
-        # Periodically click the Turnstile widget to trigger the challenge flow.
-        # In headless mode, the widget may need an explicit click.
-        if current_time - last_click_time > 2:
-          # Strategy 1: Click the outer container
-          try:
-            widget = page.locator('.cf-turnstile')
-            if await widget.count() > 0:
-              await widget.click(timeout=1500, force=True)
-              widget_click_count += 1
-              last_click_time = current_time
-              logger.debug(f"Clicked Turnstile widget ({widget_click_count}x)")
-          except Exception as e:
-            logger.debug(f"Widget click failed: {e}")
-
-            # Strategy 2: Click inside the Turnstile iframe
-            try:
-              iframe = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-              await iframe.locator('body').click(timeout=1000)
-              iframe_click_count += 1
-              last_click_time = current_time
-              logger.debug(f"Clicked Turnstile iframe ({iframe_click_count}x)")
-            except Exception:
-              try:
-                # Alternate iframe selector
-                iframe = page.frame_locator('iframe[title*="Cloudflare"]')
-                await iframe.locator('body').click(timeout=1000)
-                iframe_click_count += 1
-                last_click_time = current_time
-                logger.debug(f"Clicked Cloudflare iframe ({iframe_click_count}x)")
-              except Exception as iframe_e:
-                logger.debug(f"Iframe click failed: {iframe_e}")
-
-          # Strategy 3: Use JavaScript to force-check the checkbox inside iframe
-          if widget_click_count > 2 and iframe_click_count == 0:
-            try:
-              await page.evaluate("""
-                (() => {
-                  const frames = document.querySelectorAll('iframe');
-                  for (const frame of frames) {
-                    if (frame.src && frame.src.includes('cloudflare')) {
-                      frame.style.display = 'block';
-                      frame.style.visibility = 'visible';
-                      frame.style.opacity = '1';
-                      frame.style.width = '300px';
-                      frame.style.height = '65px';
-                    }
-                  }
-                  const container = document.querySelector('.cf-turnstile');
-                  if (container) {
-                    container.style.display = 'block';
-                    container.style.visibility = 'visible';
-                    container.style.opacity = '1';
-                    container.style.minHeight = '65px';
-                    container.style.minWidth = '300px';
-                  }
-                })()
-              """)
-            except Exception:
-              pass
+        # Also try the textarea variant (some Turnstile versions)
+        token = await page.evaluate("""
+          (() => {
+            const el = document.querySelector('textarea[name=cf-turnstile-response]');
+            if (el && el.value && el.value.length > 10) return el.value;
+            return '';
+          })()
+        """)
+        if token and len(token) > 10:
+          logger.info(f"Token found via textarea: {token[:30]}...")
+          return token
 
       except Exception as e:
         logger.debug(f"Token poll error: {e}")
 
       await asyncio.sleep(interval)
 
-    logger.warning(f"Token not found after {timeout}s (widget_clicks={widget_click_count}, iframe_clicks={iframe_click_count})")
+    logger.warning(f"Token not found after {timeout}s")
     return None
 
   async def _setup_page(
@@ -412,22 +357,6 @@ class TurnstileSolver:
       return
 
     page = await page_or_context.new_page() if isinstance(page_or_context, BrowserContext) else page_or_context
-
-    # Expose a direct Python callback that the page can call to forward Turnstile
-    # messages. This avoids relying on `fetch(http://127.0.0.1/...)`, which can be
-    # blocked as mixed-content when the page origin is HTTPS.
-    async def _turnstile_msg_bridge(source, payload):  # noqa: ARG001
-      try:
-        if isinstance(payload, dict):
-          await self.server.dispatch_captcha_message_event(id=id, payload=payload)
-      except Exception as ex:
-        logger.debug(f"Turnstile message bridge error: {ex}")
-
-    try:
-      await page.expose_binding("__turnstileSolverCallback", _turnstile_msg_bridge)
-    except Exception:
-      # If the page is reused and the binding already exists, ignore.
-      pass
 
     pageContent = c.HTML_TEMPLATE.format(
       local_server_port=self.server.port,
@@ -457,46 +386,18 @@ class TurnstileSolver:
       await page.reload(timeout=self.page_load_timeout * 1000)
 
     # Wait for the Turnstile widget div to be attached to the DOM.
-    # Use state="attached" because the widget may be hidden initially
-    # (the Turnstile JS will make it visible once it loads the iframe).
     try:
       await page.wait_for_selector('.cf-turnstile', state="attached", timeout=15000)
       logger.debug("Turnstile widget div attached to DOM")
     except Exception as e:
       logger.warning(f"Turnstile widget div not attached after 15s: {e}")
 
-    # Wait a moment for the Turnstile iframe to appear inside the container.
-    # The widget loading the challenge iframe is a strong signal that
-    # Turnstile initialised correctly.
+    # Wait for the Turnstile iframe to appear inside the container.
     try:
       await page.wait_for_selector('.cf-turnstile iframe', state="attached", timeout=20000)
       logger.debug("Turnstile challenge iframe attached")
     except Exception as e:
       logger.warning(f"Turnstile challenge iframe not found after 20s: {e}")
-
-    # Try to force widget visibility via JS in case it is still hidden
-    try:
-      await page.evaluate("""
-        const el = document.querySelector('.cf-turnstile');
-        if (el) {
-          el.style.display = 'block';
-          el.style.visibility = 'visible';
-          el.style.opacity = '1';
-          el.style.minHeight = '65px';
-          el.style.minWidth = '300px';
-        }
-        const container = document.getElementById('turnstile-container');
-        if (container) {
-          container.style.display = 'flex';
-          container.style.visibility = 'visible';
-          container.style.minHeight = '65px';
-        }
-      """)
-    except Exception as e:
-      logger.debug(f"Force visibility script error: {e}")
-
-    page.window_width = await page.evaluate("window.innerWidth")
-    page.window_height = await page.evaluate("window.innerHeight")
 
     return page
 
@@ -510,22 +411,11 @@ class TurnstileSolver:
     if not playwright:
       playwright = await async_playwright().start()
 
-    # ── Headless mode selection ──
-    # Cloudflare Turnstile detects headless browsers and blocks the CAPTCHA.
-    # When running in Docker/Railway, we use Xvfb to provide a virtual display
-    # so the browser can run in headed mode (headless=False). This is the ONLY
-    # reliable way to solve Turnstile — headless=True always fails.
-    #
-    # headless_mode=False = headed browser (uses Xvfb display in Docker)
-    headless_mode = False  # Always use headed mode — Turnstile blocks headless
+    # Use the browser channel from self.browser (e.g. "chromium", "chrome").
+    # Patchright's bundled Chromium is the default and works in Docker.
+    channel = self.browser if self.browser != "chromium" else None
 
-    # ── Channel selection ──
-    # In Docker/Railway, patchright's bundled Chromium is guaranteed to work.
-    # Specifying a channel can cause launch failures where a system Chromium
-    # may not be installed at the expected path.
-    channel = None  # Always use patchright's bundled Chromium
-
-    logger.info(f"Launching browser: headless={headless_mode}, channel={channel}, "
+    logger.info(f"Launching browser: headless={self.headless}, channel={channel}, "
                 f"executable_path={self.browser_executable_path}, "
                 f"args_count={len(self.browser_args)}")
     logger.debug(f"Browser args: {self.browser_args}")
@@ -535,7 +425,7 @@ class TurnstileSolver:
         executable_path=self.browser_executable_path,
         channel=channel,
         args=self.browser_args,
-        headless=headless_mode,
+        headless=self.headless,
         proxy=proxy.dict() if proxy else None,
       )
     except Exception as launch_err:
@@ -548,7 +438,7 @@ class TurnstileSolver:
             executable_path=self.browser_executable_path,
             channel=None,
             args=self.browser_args,
-            headless=headless_mode,
+            headless=self.headless,
             proxy=proxy.dict() if proxy else None,
           )
         except Exception as retry_err:
@@ -574,38 +464,19 @@ class TurnstileSolver:
       logger.warning("Browser provided without Playwright instance — creating a new Playwright")
       playwright = await async_playwright().start()
 
+    # Match the working odell0111 original:
+    # - no_viewport=True: do NOT set an explicit viewport — an explicit viewport
+    #   is a fingerprinting signal that Turnstile can detect. The browser window
+    #   size is controlled by --window-size in BROWSER_ARGS instead.
+    # - NO user_agent override: Patchright's default UA is fine; overriding it
+    #   is another fingerprinting signal.
+    # - NO add_init_script(): Patchright already handles anti-detection internally.
+    #   Adding our own init scripts can CONFLICT with Patchright's patches and
+    #   actually make detection MORE likely (e.g. double-overriding navigator.webdriver).
     context = await browser.new_context(
       proxy=proxy.dict() if proxy else None,
-      viewport={"width": 1920, "height": 1080},
-      no_viewport=False,
-      user_agent=(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-      ),
+      no_viewport=True,
     )
-
-    # Anti-detection: override navigator.webdriver so Cloudflare can't
-    # trivially flag the browser as automated.  These overrides must run
-    # before any page scripts execute (add_init_script guarantees this).
-    await context.add_init_script("""
-      // Hide webdriver flag
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      // Patch chrome runtime to look like a real browser
-      if (!window.chrome) { window.chrome = {}; }
-      if (!window.chrome.runtime) { window.chrome.runtime = {}; }
-      // Fake plugins length (headless has 0, normal has 5+)
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => [1, 2, 3, 4, 5],
-      });
-      // Fake languages
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en'],
-      });
-    """)
-
-    # await context.route('**', lambda route: route.continue_())
-    # await context.set_extra_http_headers({'HTTP2-Settings': 'MAX_CONCURRENT_STREAMS=100'})
 
     if playwright is None:
       raise RuntimeError("Playwright instance is None (this should never happen)")

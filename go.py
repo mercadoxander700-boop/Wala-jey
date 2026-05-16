@@ -371,19 +371,14 @@ async def init_solver(proxy_file: str):
         print(f"=> Solver proxy provider: {len(proxy_provider.proxies)} proxies loaded")
 
         # ── Build solver + server manually ──
-        # Browser args for Docker/Xvfb headed mode.
-        # These are CRITICAL for Turnstile to render correctly inside a container:
-        #   --use-gl=swiftshader    — software GL rendering (no real GPU in Docker)
-        #   --enable-webgl          — Turnstile needs WebGL to fingerprint the browser
-        #   --enable-unsafe-webgpu  — same, allows WebGPU which Turnstile checks
-        #   --start-maximized       — ensure full viewport for widget rendering
-        #   --enable-features=...   — SharedArrayBuffer + trust tokens Turnstile relies on
-        # Do NOT add --disable-gpu or --disable-software-rasterizer — they break WebGL!
+        # These extra args are passed ON TOP of the BROWSER_ARGS already defined
+        # in solver.py. The solver.py BROWSER_ARGS already include the full set
+        # of Docker/Xvfb flags (including --disable-gpu, --disable-software-rasterizer,
+        # --use-gl=swiftshader, --enable-webgl, etc.) that are proven to work.
+        #
+        # We only add the --enable-features flag here since solver.py's BROWSER_ARGS
+        # already has a version but we want to make sure these specific ones are present.
         extra_args = [
-            "--use-gl=swiftshader",
-            "--enable-webgl",
-            "--enable-unsafe-webgpu",
-            "--start-maximized",
             "--enable-features=SharedArrayBuffer,TrustTokens,PrivateNetworkAccessChecksBypassingPermissionPolicy",
         ]
 

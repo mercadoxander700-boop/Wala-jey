@@ -8,8 +8,8 @@ set -e
 # and blocks the CAPTCHA. Headed mode with Xvfb is the only working approach.
 if command -v Xvfb >/dev/null 2>&1; then
     if [ -z "${DISPLAY}" ] || [ "${DISPLAY}" = ":99" ]; then
-        echo "=> Starting Xvfb on :99 (1920x1080x24) ..."
-        Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac &
+        echo "=> Starting Xvfb on :99 (1024x768x16) ..."
+        Xvfb :99 -screen 0 1024x768x16 -nolisten tcp -ac &
         XVFB_PID=$!
         export DISPLAY=:99
 
